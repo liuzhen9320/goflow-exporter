@@ -41,3 +41,381 @@
 28. 建立基础错误处理机制，对网络异常、解析失败、内存压力等情况记录日志并继续运行，保障服务持续可用。
 29. 集成 `charmbracelet/log` 作为统一日志组件，支持结构化日志输出，便于调试与运维排查。
 30. 将所有代码放入一个 main.go 里，所有上述要求必需完整实现，不得留有 TODO；另外你只需要输出 main.go 和 config.yaml 和示例查询即可
+
+---
+
+# Flow Collector Configuration
+
+```yaml
+# Server configuration
+server:
+  # UDP listening ports for different protocols
+  netflow_port: 2055      # NetFlow v9 port
+  sflow_port: 6343        # sFlow port  
+  ipfix_port: 4739        # IPFIX port
+  listen_addr: "0.0.0.0"  # Listen address (IPv4/IPv6)
+  metrics_port: 8080      # HTTP metrics server port
+  metrics_path: "/metrics" # Prometheus metrics endpoint path
+
+# Performance tuning
+performance:
+  buffer_size: 65536      # UDP receive buffer size
+  worker_count: 8         # Number of record processing workers
+  batch_size: 100         # Batch processing size
+  queue_size: 10000       # Channel queue size
+
+# Data aggregation settings
+aggregation:
+  # Time windows for aggregation (multiple windows supported)
+  time_windows:
+    - "1m"                # 1 minute window
+    - "5m"                # 5 minute window
+    - "15m"               # 15 minute window
+    - "1h"                # 1 hour window
+  
+  # Dimensions for aggregation grouping
+  dimensions:
+    - "src_addr"          # Source IP address
+    - "dst_addr"          # Destination IP address
+    - "protocol"          # IP protocol
+    - "src_port"          # Source port
+    - "dst_port"          # Destination port
+    - "in_if"             # Input interface
+    - "out_if"            # Output interface
+    - "src_country"       # Source country (requires GeoIP)
+    - "dst_country"       # Destination country (requires GeoIP)
+    - "src_asn"           # Source ASN (requires ASN database)
+    - "dst_asn"           # Destination ASN (requires ASN database)
+
+# IP enrichment configuration
+enrichment:
+  # GeoIP configuration
+  geoip_enabled: true
+  geoip_path: "/opt/geoip/GeoLite2-Country.mmdb"  # Path to MaxMind GeoIP2 database
+  
+  # ASN configuration  
+  asn_enabled: true
+  asn_path: "/opt/geoip/GeoLite2-ASN.mmdb"        # Path to MaxMind ASN database
+  
+  # Cache settings
+  cache_size: 100000      # Maximum cache entries for enrichment data
+
+# Prometheus metrics configuration
+metrics:
+  namespace: "flow"       # Prometheus namespace
+  subsystem: ""           # Prometheus subsystem (optional)
+  
+  # Labels to include in metrics (affects cardinality)
+  enabled_labels:
+    - "ports"             # Include src_port, dst_port labels
+    - "interfaces"        # Include in_if, out_if labels
+    - "geo"               # Include src_country, dst_country labels
+    - "asn"               # Include src_asn, dst_asn labels
+  
+  # Custom static labels added to all metrics
+  custom_labels:
+    environment: "production"
+    datacenter: "dc1"
+    collector_id: "flow-01"
+
+# Logging configuration
+logging:
+  level: "info"           # debug, info, warn, error
+  format: "json"          # json, text
+```
+
+## GeoIP Database Setup
+
+Download and extract MaxMind databases:
+
+```bash
+# Create directory
+sudo mkdir -p /opt/geoip
+
+# Download GeoLite2 databases (requires free MaxMind account)
+wget -O GeoLite2-Country.tar.gz "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-Country&license_key=YOUR_LICENSE_KEY&suffix=tar.gz"
+wget -O GeoLite2-ASN.tar.gz "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-ASN&license_key=YOUR_LICENSE_KEY&suffix=tar.gz"
+
+# Extract databases
+tar -xzf GeoLite2-Country.tar.gz --wildcards --no-anchored '*.mmdb' --strip-components=1
+tar -xzf GeoLite2-ASN.tar.gz --wildcards --no-anchored '*.mmdb' --strip-components=1
+
+# Move to target directory
+sudo mv *.mmdb /opt/geoip/
+```
+
+## Minimal Configuration (No Enrichment)
+
+```yaml
+server:
+  netflow_port: 2055
+  sflow_port: 6343
+  ipfix_port: 4739
+  listen_addr: "0.0.0.0"
+  metrics_port: 8080
+
+performance:
+  worker_count: 4
+  queue_size: 1000
+
+aggregation:
+  time_windows:
+    - "1m"
+    - "5m"
+  dimensions:
+    - "src_addr"
+    - "dst_addr"
+    - "protocol"
+
+enrichment:
+  geoip_enabled: false
+  asn_enabled: false
+
+metrics:
+  namespace: "flow"
+  enabled_labels: []
+
+logging:
+  level: "info"
+```
+
+---
+
+# Prometheus & Grafana Query Examples
+
+## Basic Traffic Metrics
+
+### Total Flows per Second
+```promql
+# Rate of flows per second
+rate(flow_flows_total[1m])
+
+# Top 10 source IPs by flow rate
+topk(10, sum(rate(flow_flows_total[5m])) by (src_addr))
+
+# Top 10 destination IPs by flow rate  
+topk(10, sum(rate(flow_flows_total[5m])) by (dst_addr))
+```
+
+### Bandwidth Metrics
+```promql
+# Total bandwidth in bits per second
+sum(flow_bandwidth_bps)
+
+# Bandwidth by source IP
+sum(flow_bandwidth_bps) by (src_addr)
+
+# Bandwidth by destination IP
+sum(flow_bandwidth_bps) by (dst_addr)
+
+# Top bandwidth consumers
+topk(10, sum(flow_bandwidth_bps) by (src_addr, dst_addr))
+```
+
+### Packet Analysis
+```promql
+# Packet rate per second
+rate(flow_packets_total[1m])
+
+# Average packet size in bytes
+rate(flow_bytes_total[5m]) / rate(flow_packets_total[5m])
+
+# Packets per flow ratio
+rate(flow_packets_total[5m]) / rate(flow_flows_total[5m])
+```
+
+## Protocol Analysis
+
+### Traffic by Protocol
+```promql
+# Bandwidth by protocol
+sum(flow_bandwidth_bps) by (protocol)
+
+# Flow rate by protocol
+sum(rate(flow_flows_total[5m])) by (protocol)
+
+# Protocol distribution (percentage)
+sum(rate(flow_bytes_total[5m])) by (protocol) / sum(rate(flow_bytes_total[5m])) * 100
+```
+
+### Port Analysis
+```promql
+# Top destination ports by bandwidth
+topk(20, sum(flow_bandwidth_bps) by (dst_port))
+
+# Top source ports by flow count
+topk(20, sum(rate(flow_flows_total[5m])) by (src_port))
+
+# Web traffic (ports 80, 443)
+sum(flow_bandwidth_bps{dst_port=~"80|443"})
+
+# SSH traffic analysis
+sum(rate(flow_flows_total[5m]){dst_port="22"}) by (src_addr)
+```
+
+## Geographic Analysis (GeoIP Enabled)
+
+### Traffic by Country
+```promql
+# Bandwidth by source country
+sum(flow_bandwidth_bps) by (src_country)
+
+# Bandwidth by destination country
+sum(flow_bandwidth_bps) by (dst_country)
+
+# International vs domestic traffic
+sum(flow_bandwidth_bps{src_country!="",dst_country!="",src_country!=dst_country})
+sum(flow_bandwidth_bps{src_country!="",dst_country!="",src_country==dst_country})
+
+# Top countries by incoming traffic
+topk(10, sum(flow_bandwidth_bps) by (src_country))
+```
+
+### Cross-Border Traffic Matrix
+```promql
+# Traffic matrix between countries
+sum(flow_bandwidth_bps) by (src_country, dst_country)
+
+# Outbound traffic from specific country
+sum(flow_bandwidth_bps{src_country="US"}) by (dst_country)
+```
+
+## ASN Analysis
+
+### Traffic by Autonomous System
+```promql
+# Bandwidth by source ASN
+sum(flow_bandwidth_bps) by (src_asn)
+
+# Top ASNs by traffic volume
+topk(15, sum(rate(flow_bytes_total[5m])) by (src_asn))
+
+# Peering analysis - traffic between ASNs
+sum(flow_bandwidth_bps{src_asn!="",dst_asn!="",src_asn!=dst_asn}) by (src_asn, dst_asn)
+
+# Major cloud provider traffic
+sum(flow_bandwidth_bps{src_asn=~"15169|16509|8075"}) by (src_asn)
+# 15169: Google, 16509: Amazon, 8075: Microsoft
+```
+
+## Interface Analysis
+
+### Per-Interface Metrics
+```promql
+# Inbound traffic per interface
+sum(flow_bandwidth_bps) by (in_if)
+
+# Outbound traffic per interface  
+sum(flow_bandwidth_bps) by (out_if)
+
+# Interface utilization (assuming 1Gbps interfaces)
+sum(flow_bandwidth_bps) by (in_if) / 1000000000 * 100
+
+# Top interfaces by flow count
+topk(10, sum(rate(flow_flows_total[5m])) by (in_if))
+```
+
+## Security & Anomaly Detection
+
+### Potential DDoS Detection
+```promql
+# High packet rate to single destination
+topk(5, sum(rate(flow_packets_total[1m])) by (dst_addr))
+
+# Many flows from single source
+topk(10, sum(rate(flow_flows_total[1m])) by (src_addr))
+
+# Small packet size anomaly (potential attack)
+bottomk(10, rate(flow_bytes_total[5m]) / rate(flow_packets_total[5m])) by (src_addr, dst_addr)
+
+# Unusual port activity
+sum(rate(flow_flows_total[5m]){dst_port!~"80|443|53|22|25|110|993|995"}) by (dst_port)
+```
+
+### Port Scanning Detection
+```promql
+# High number of unique destination ports from single source
+count(sum(rate(flow_flows_total[5m])) by (src_addr, dst_port)) by (src_addr)
+
+# Failed connection attempts (assuming low byte count indicates failed connections)
+sum(rate(flow_flows_total[5m]){bytes<100}) by (src_addr)
+```
+
+## System Health Monitoring
+
+### Collector Performance
+```promql
+# Collection rate
+rate(flow_received_packets_total[1m])
+rate(flow_parsed_records_total[1m])  
+rate(flow_dropped_records_total[1m])
+
+# Drop rate percentage
+rate(flow_dropped_records_total[1m]) / rate(flow_received_packets_total[1m]) * 100
+
+# Processing latency
+histogram_quantile(0.95, rate(flow_processing_duration_seconds_bucket[5m]))
+histogram_quantile(0.99, rate(flow_processing_duration_seconds_bucket[5m]))
+
+# Queue depth
+flow_worker_queue_length
+```
+
+## Grafana Dashboard Panels
+
+### Single Stat Panels
+- Total Bandwidth: `sum(flow_bandwidth_bps)`
+- Total Flows/sec: `sum(rate(flow_flows_total[1m]))`  
+- Drop Rate: `rate(flow_dropped_records_total[1m]) / rate(flow_received_packets_total[1m]) * 100`
+
+### Time Series Graphs
+- Bandwidth Over Time: `sum(flow_bandwidth_bps)`
+- Flow Rate: `sum(rate(flow_flows_total[1m]))`
+- Protocol Distribution: `sum(flow_bandwidth_bps) by (protocol)`
+
+### Top Lists (Table Panels)
+- Top Sources: `topk(10, sum(rate(flow_bytes_total[5m])) by (src_addr))`
+- Top Destinations: `topk(10, sum(rate(flow_bytes_total[5m])) by (dst_addr))`
+- Top Ports: `topk(20, sum(flow_bandwidth_bps) by (dst_port))`
+
+### Heatmaps
+- Traffic Matrix: `sum(flow_bandwidth_bps) by (src_country, dst_country)`
+- Port Activity: `sum(rate(flow_flows_total[5m])) by (dst_port)`
+
+## Alerting Rules
+
+### High Traffic Alert
+```yaml
+- alert: HighBandwidthUsage
+  expr: sum(flow_bandwidth_bps) > 800000000  # 800 Mbps
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "High bandwidth usage detected"
+    description: "Total bandwidth usage is {{ $value | humanize }}bps"
+```
+
+### DDoS Detection Alert
+```yaml
+- alert: PotentialDDoSAttack
+  expr: sum(rate(flow_packets_total[1m])) by (dst_addr) > 10000
+  for: 30s
+  labels:
+    severity: critical
+  annotations:
+    summary: "Potential DDoS attack detected"
+    description: "High packet rate to {{ $labels.dst_addr }}: {{ $value | humanize }} pps"
+```
+
+### Collector Health Alert
+```yaml
+- alert: FlowCollectorDrops
+  expr: rate(flow_dropped_records_total[5m]) / rate(flow_received_packets_total[5m]) > 0.1
+  for: 1m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Flow collector dropping packets"
+    description: "Drop rate is {{ $value | humanizePercentage }}"
+```
