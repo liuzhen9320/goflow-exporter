@@ -1,0 +1,75 @@
+# Server configuration
+server:
+  # UDP listening ports for different protocols
+  netflow_port: 2055      # NetFlow v9 port
+  sflow_port: 6343        # sFlow port  
+  ipfix_port: 4739        # IPFIX port
+  listen_addr: "0.0.0.0"  # Listen address (IPv4/IPv6)
+  metrics_port: 8080      # HTTP metrics server port
+  metrics_path: "/metrics" # Prometheus metrics endpoint path
+
+# Performance tuning
+performance:
+  buffer_size: 65536      # UDP receive buffer size
+  worker_count: 8         # Number of record processing workers
+  batch_size: 100         # Batch processing size
+  queue_size: 10000       # Channel queue size
+
+# Data aggregation settings
+aggregation:
+  # Time windows for aggregation (multiple windows supported)
+  time_windows:
+    - "1m"                # 1 minute window
+    - "5m"                # 5 minute window
+    - "15m"               # 15 minute window
+    - "1h"                # 1 hour window
+  
+  # Dimensions for aggregation grouping
+  dimensions:
+    - "src_addr"          # Source IP address
+    - "dst_addr"          # Destination IP address
+    - "protocol"          # IP protocol
+    - "src_port"          # Source port
+    - "dst_port"          # Destination port
+    - "in_if"             # Input interface
+    - "out_if"            # Output interface
+    - "src_country"       # Source country (requires GeoIP)
+    - "dst_country"       # Destination country (requires GeoIP)
+    - "src_asn"           # Source ASN (requires ASN database)
+    - "dst_asn"           # Destination ASN (requires ASN database)
+
+# IP enrichment configuration
+enrichment:
+  # GeoIP configuration
+  geoip_enabled: true
+  geoip_path: "/opt/geoip/GeoLite2-Country.mmdb"  # Path to MaxMind GeoIP2 database
+  
+  # ASN configuration  
+  asn_enabled: true
+  asn_path: "/opt/geoip/GeoLite2-ASN.mmdb"        # Path to MaxMind ASN database
+  
+  # Cache settings
+  cache_size: 100000      # Maximum cache entries for enrichment data
+
+# Prometheus metrics configuration
+metrics:
+  namespace: "flow"       # Prometheus namespace
+  subsystem: ""           # Prometheus subsystem (optional)
+  
+  # Labels to include in metrics (affects cardinality)
+  enabled_labels:
+    - "ports"             # Include src_port, dst_port labels
+    - "interfaces"        # Include in_if, out_if labels
+    - "geo"               # Include src_country, dst_country labels
+    - "asn"               # Include src_asn, dst_asn labels
+  
+  # Custom static labels added to all metrics
+  custom_labels:
+    environment: "production"
+    datacenter: "dc1"
+    collector_id: "flow-01"
+
+# Logging configuration
+logging:
+  level: "info"           # debug, info, warn, error
+  format: "json"          # json, text
