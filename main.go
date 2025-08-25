@@ -1,3 +1,4 @@
+// main.go
 package main
 
 import (
@@ -41,12 +42,12 @@ type Config struct {
 		Workers        int    `yaml:"workers"`
 		BatchSize      int    `yaml:"batch_size"`
 	} `yaml:"server"`
-	
+
 	Logging struct {
 		Level      string `yaml:"level"`
 		Structured bool   `yaml:"structured"`
 	} `yaml:"logging"`
-	
+
 	Metrics struct {
 		Namespace string `yaml:"namespace"`
 		Subsystem string `yaml:"subsystem"`
@@ -56,12 +57,12 @@ type Config struct {
 			Dimensions  []string `yaml:"dimensions"`
 		} `yaml:"labels"`
 	} `yaml:"metrics"`
-	
+
 	Aggregation struct {
 		TimeWindows []string `yaml:"time_windows"`
 		Dimensions  []string `yaml:"dimensions"`
 	} `yaml:"aggregation"`
-	
+
 	GeoIP struct {
 		DatabasePath    string `yaml:"database_path"`
 		ASNDatabasePath string `yaml:"asn_database_path"`
@@ -147,10 +148,10 @@ type NetFlowV9Field struct {
 
 // IPFIX structures
 type IPFIXHeader struct {
-	Version        uint16
-	Length         uint16
-	ExportTime     uint32
-	SequenceNum    uint32
+	Version             uint16
+	Length              uint16
+	ExportTime          uint32
+	SequenceNum         uint32
 	ObservationDomainID uint32
 }
 
@@ -158,11 +159,32 @@ type IPFIXHeader struct {
 type SFlowHeader struct {
 	Version        uint32
 	AddressType    uint32
-	AgentAddress   uint32
+	AgentAddress   [16]byte
 	SubAgentID     uint32
 	SequenceNum    uint32
 	SysUptime      uint32
 	NumSamples     uint32
+}
+
+// SFlow Sample types
+const (
+	SFLOW_FLOW_SAMPLE     = 1
+	SFLOW_COUNTER_SAMPLE  = 2
+	SFLOW_EXPANDED_SAMPLE = 3
+)
+
+type SFlowFlowSample struct {
+	SampleType       uint32
+	SampleLength     uint32
+	SequenceNum      uint32
+	SourceIDType     uint32
+	SourceIDIndex    uint32
+	SamplingRate     uint32
+	SamplePool       uint32
+	DroppedPackets   uint32
+	InputInterface   uint32
+	OutputInterface  uint32
+	NumRecords       uint32
 }
 
 // Main collector structure
@@ -173,7 +195,7 @@ type FlowCollector struct {
 	asnDB     *geoip2.Reader
 	geoCache  sync.Map
 	templates sync.Map
-	
+
 	// Metrics
 	flowsTotal          *prometheus.CounterVec
 	bytesTotal          *prometheus.CounterVec
@@ -184,11 +206,12 @@ type FlowCollector struct {
 	droppedRecords      prometheus.Counter
 	processingDuration  prometheus.Histogram
 	workerQueueLength   prometheus.Gauge
-	
+
 	// Aggregation
-	aggregatedFlows sync.Map
-	aggregationMutex sync.RWMutex
-	
+	aggregatedFlows   map[string]map[FlowKey]AggregatedFlow
+	aggregationMutex  sync.RWMutex
+	timeWindowMutexes map[string]*sync.RWMutex
+
 	// Channels
 	flowChan chan FlowRecord
 	stopChan chan struct{}
@@ -200,12 +223,12 @@ func loadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-	
+
 	// Set defaults
 	if config.Server.MetricsPort == 0 {
 		config.Server.MetricsPort = 8080
@@ -214,7 +237,7 @@ func loadConfig(path string) (*Config, error) {
 		config.Server.MetricsPath = "/metrics"
 	}
 	if config.Server.ReadBufferSize == 0 {
-		config.Server.ReadBufferSize = 4096
+		config.Server.ReadBufferSize = 8192
 	}
 	if config.Server.Workers == 0 {
 		config.Server.Workers = 4
@@ -225,16 +248,29 @@ func loadConfig(path string) (*Config, error) {
 	if config.Metrics.Namespace == "" {
 		config.Metrics.Namespace = "flow"
 	}
+	if config.Metrics.Subsystem == "" {
+		config.Metrics.Subsystem = "collector"
+	}
 	if len(config.Aggregation.TimeWindows) == 0 {
 		config.Aggregation.TimeWindows = []string{"1m", "5m", "15m", "1h"}
 	}
-	
+	if config.GeoIP.CacheTTL == "" {
+		config.GeoIP.CacheTTL = "1h"
+	}
+	if config.GeoIP.CacheSize == 0 {
+		config.GeoIP.CacheSize = 10000
+	}
+
 	return &config, nil
 }
 
 func NewFlowCollector(config *Config) (*FlowCollector, error) {
 	logger := log.New(os.Stdout)
-	
+	if config.Logging.Structured {
+		logger.SetReportCaller(false)
+		logger.SetTimeFormat(time.Kitchen)
+	}
+
 	// Set log level
 	switch strings.ToLower(config.Logging.Level) {
 	case "debug":
@@ -248,57 +284,68 @@ func NewFlowCollector(config *Config) (*FlowCollector, error) {
 	default:
 		logger.SetLevel(log.InfoLevel)
 	}
-	
+
 	collector := &FlowCollector{
-		config:   config,
-		logger:   logger,
-		flowChan: make(chan FlowRecord, config.Server.BatchSize*10),
-		stopChan: make(chan struct{}),
+		config:            config,
+		logger:            logger,
+		flowChan:          make(chan FlowRecord, config.Server.BatchSize*10),
+		stopChan:          make(chan struct{}),
+		aggregatedFlows:   make(map[string]map[FlowKey]AggregatedFlow),
+		timeWindowMutexes: make(map[string]*sync.RWMutex),
 	}
-	
+
+	// Initialize time window maps
+	for _, window := range config.Aggregation.TimeWindows {
+		collector.aggregatedFlows[window] = make(map[FlowKey]AggregatedFlow)
+		collector.timeWindowMutexes[window] = &sync.RWMutex{}
+	}
+
 	// Initialize GeoIP databases
 	if config.Metrics.Labels.EnableGeoIP && config.GeoIP.DatabasePath != "" {
 		db, err := geoip2.Open(config.GeoIP.DatabasePath)
 		if err != nil {
-			logger.Warn("Failed to open GeoIP database", "error", err)
+			logger.Warn("Failed to open GeoIP database", "error", err, "path", config.GeoIP.DatabasePath)
 		} else {
 			collector.geoipDB = db
 			logger.Info("GeoIP database loaded", "path", config.GeoIP.DatabasePath)
 		}
 	}
-	
+
 	if config.Metrics.Labels.EnableASN && config.GeoIP.ASNDatabasePath != "" {
 		db, err := geoip2.Open(config.GeoIP.ASNDatabasePath)
 		if err != nil {
-			logger.Warn("Failed to open ASN database", "error", err)
+			logger.Warn("Failed to open ASN database", "error", err, "path", config.GeoIP.ASNDatabasePath)
 		} else {
 			collector.asnDB = db
 			logger.Info("ASN database loaded", "path", config.GeoIP.ASNDatabasePath)
 		}
 	}
-	
+
 	// Initialize Prometheus metrics
 	collector.initMetrics()
-	
+
 	return collector, nil
 }
 
 func (fc *FlowCollector) initMetrics() {
 	labels := []string{"protocol"}
-	
+
 	// Add optional labels based on configuration
+	validDims := map[string]bool{"src_port": true, "dst_port": true, "input_iface": true, "output_iface": true}
 	for _, dim := range fc.config.Metrics.Labels.Dimensions {
-		labels = append(labels, dim)
+		if validDims[dim] {
+			labels = append(labels, dim)
+		}
 	}
-	
+
 	if fc.config.Metrics.Labels.EnableGeoIP {
 		labels = append(labels, "src_country", "dst_country")
 	}
-	
+
 	if fc.config.Metrics.Labels.EnableASN {
 		labels = append(labels, "src_asn", "dst_asn")
 	}
-	
+
 	fc.flowsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -308,7 +355,7 @@ func (fc *FlowCollector) initMetrics() {
 		},
 		labels,
 	)
-	
+
 	fc.bytesTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -318,7 +365,7 @@ func (fc *FlowCollector) initMetrics() {
 		},
 		labels,
 	)
-	
+
 	fc.packetsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -328,7 +375,7 @@ func (fc *FlowCollector) initMetrics() {
 		},
 		labels,
 	)
-	
+
 	fc.bandwidthGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -338,7 +385,7 @@ func (fc *FlowCollector) initMetrics() {
 		},
 		[]string{"direction", "interface"},
 	)
-	
+
 	// System metrics
 	fc.receivedPackets = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -348,7 +395,7 @@ func (fc *FlowCollector) initMetrics() {
 			Help:      "Total number of received raw packets",
 		},
 	)
-	
+
 	fc.parsedRecords = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -357,7 +404,7 @@ func (fc *FlowCollector) initMetrics() {
 			Help:      "Total number of successfully parsed flow records",
 		},
 	)
-	
+
 	fc.droppedRecords = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -366,7 +413,7 @@ func (fc *FlowCollector) initMetrics() {
 			Help:      "Total number of dropped or failed records",
 		},
 	)
-	
+
 	fc.processingDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -376,7 +423,7 @@ func (fc *FlowCollector) initMetrics() {
 			Buckets:   prometheus.DefBuckets,
 		},
 	)
-	
+
 	fc.workerQueueLength = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: fc.config.Metrics.Namespace,
@@ -385,7 +432,7 @@ func (fc *FlowCollector) initMetrics() {
 			Help:      "Current length of worker processing queue",
 		},
 	)
-	
+
 	// Register metrics
 	prometheus.MustRegister(fc.flowsTotal)
 	prometheus.MustRegister(fc.bytesTotal)
@@ -399,12 +446,12 @@ func (fc *FlowCollector) initMetrics() {
 }
 
 func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32, asOrg string) {
-	if ip == nil {
+	if ip == nil || ip.IsUnspecified() {
 		return "", "", 0, ""
 	}
-	
+
 	ipStr := ip.String()
-	
+
 	// Check cache first
 	if cached, ok := fc.geoCache.Load(ipStr); ok {
 		entry := cached.(GeoIPEntry)
@@ -413,15 +460,19 @@ func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32
 		}
 		fc.geoCache.Delete(ipStr)
 	}
-	
+
 	// Query GeoIP database
 	if fc.geoipDB != nil {
 		if record, err := fc.geoipDB.City(ip); err == nil {
-			country = record.Country.IsoCode
-			city = record.City.Names["en"]
+			if record.Country.IsoCode != "" {
+				country = record.Country.IsoCode
+			}
+			if record.City.Names["en"] != "" {
+				city = record.City.Names["en"]
+			}
 		}
 	}
-	
+
 	// Query ASN database
 	if fc.asnDB != nil {
 		if record, err := fc.asnDB.ASN(ip); err == nil {
@@ -429,7 +480,7 @@ func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32
 			asOrg = record.AutonomousSystemOrganization
 		}
 	}
-	
+
 	// Cache the result
 	cacheTTL := 1 * time.Hour
 	if fc.config.GeoIP.CacheTTL != "" {
@@ -437,7 +488,7 @@ func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32
 			cacheTTL = duration
 		}
 	}
-	
+
 	entry := GeoIPEntry{
 		Country: country,
 		City:    city,
@@ -446,7 +497,24 @@ func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32
 		Expiry:  time.Now().Add(cacheTTL),
 	}
 	fc.geoCache.Store(ipStr, entry)
-	
+
+	// Enforce cache size limit (LRU approximation via random eviction)
+	var count int
+	fc.geoCache.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	if count > fc.config.GeoIP.CacheSize {
+		// Trigger cleanup of expired entries
+		now := time.Now()
+		fc.geoCache.Range(func(key, value interface{}) bool {
+			if value.(GeoIPEntry).Expiry.Before(now) {
+				fc.geoCache.Delete(key)
+			}
+			return true
+		})
+	}
+
 	return country, city, asn, asOrg
 }
 
@@ -454,7 +522,7 @@ func (fc *FlowCollector) buildLabels(flow FlowRecord) prometheus.Labels {
 	labels := prometheus.Labels{
 		"protocol": strconv.Itoa(int(flow.Protocol)),
 	}
-	
+
 	// Add dimensional labels
 	for _, dim := range fc.config.Metrics.Labels.Dimensions {
 		switch dim {
@@ -468,7 +536,7 @@ func (fc *FlowCollector) buildLabels(flow FlowRecord) prometheus.Labels {
 			labels["output_iface"] = strconv.Itoa(int(flow.OutputIface))
 		}
 	}
-	
+
 	// Add GeoIP labels
 	if fc.config.Metrics.Labels.EnableGeoIP {
 		srcCountry, _, _, _ := fc.getGeoInfo(flow.SrcAddr)
@@ -476,15 +544,19 @@ func (fc *FlowCollector) buildLabels(flow FlowRecord) prometheus.Labels {
 		labels["src_country"] = srcCountry
 		labels["dst_country"] = dstCountry
 	}
-	
+
 	// Add ASN labels
 	if fc.config.Metrics.Labels.EnableASN {
 		_, _, srcASN, _ := fc.getGeoInfo(flow.SrcAddr)
 		_, _, dstASN, _ := fc.getGeoInfo(flow.DstAddr)
-		labels["src_asn"] = strconv.Itoa(int(srcASN))
-		labels["dst_asn"] = strconv.Itoa(int(dstASN))
+		if srcASN > 0 {
+			labels["src_asn"] = fmt.Sprintf("AS%d", srcASN)
+		}
+		if dstASN > 0 {
+			labels["dst_asn"] = fmt.Sprintf("AS%d", dstASN)
+		}
 	}
-	
+
 	return labels
 }
 
@@ -493,22 +565,27 @@ func (fc *FlowCollector) processFlow(flow FlowRecord) {
 	defer func() {
 		fc.processingDuration.Observe(time.Since(start).Seconds())
 	}()
-	
+
 	labels := fc.buildLabels(flow)
-	
+
 	fc.flowsTotal.With(labels).Inc()
 	fc.bytesTotal.With(labels).Add(float64(flow.Bytes))
 	fc.packetsTotal.With(labels).Add(float64(flow.Packets))
-	
+
 	fc.parsedRecords.Inc()
-	
+
 	// Update bandwidth metrics
 	duration := flow.LastSeen.Sub(flow.FirstSeen).Seconds()
 	if duration > 0 {
 		bps := float64(flow.Bytes*8) / duration
-		fc.bandwidthGauge.WithLabelValues("input", strconv.Itoa(int(flow.InputIface))).Set(bps)
+		if flow.InputIface > 0 {
+			fc.bandwidthGauge.WithLabelValues("in", strconv.Itoa(int(flow.InputIface))).Set(bps)
+		}
+		if flow.OutputIface > 0 {
+			fc.bandwidthGauge.WithLabelValues("out", strconv.Itoa(int(flow.OutputIface))).Set(bps)
+		}
 	}
-	
+
 	// Aggregate flows
 	fc.aggregateFlow(flow)
 }
@@ -523,30 +600,31 @@ func (fc *FlowCollector) aggregateFlow(flow FlowRecord) {
 		InputIface:  flow.InputIface,
 		OutputIface: flow.OutputIface,
 	}
-	
-	fc.aggregationMutex.Lock()
-	defer fc.aggregationMutex.Unlock()
-	
-	if existing, ok := fc.aggregatedFlows.Load(key); ok {
-		agg := existing.(AggregatedFlow)
-		agg.Bytes += flow.Bytes
-		agg.Packets += flow.Packets
-		agg.Flows++
-		if flow.FirstSeen.Before(agg.FirstSeen) {
-			agg.FirstSeen = flow.FirstSeen
+
+	for _, window := range fc.config.Aggregation.TimeWindows {
+		fc.timeWindowMutexes[window].Lock()
+		m := fc.aggregatedFlows[window]
+		if existing, ok := m[key]; ok {
+			existing.Bytes += flow.Bytes
+			existing.Packets += flow.Packets
+			existing.Flows++
+			if flow.FirstSeen.Before(existing.FirstSeen) {
+				existing.FirstSeen = flow.FirstSeen
+			}
+			if flow.LastSeen.After(existing.LastSeen) {
+				existing.LastSeen = flow.LastSeen
+			}
+			m[key] = existing
+		} else {
+			m[key] = AggregatedFlow{
+				Bytes:     flow.Bytes,
+				Packets:   flow.Packets,
+				Flows:     1,
+				FirstSeen: flow.FirstSeen,
+				LastSeen:  flow.LastSeen,
+			}
 		}
-		if flow.LastSeen.After(agg.LastSeen) {
-			agg.LastSeen = flow.LastSeen
-		}
-		fc.aggregatedFlows.Store(key, agg)
-	} else {
-		fc.aggregatedFlows.Store(key, AggregatedFlow{
-			Bytes:     flow.Bytes,
-			Packets:   flow.Packets,
-			Flows:     1,
-			FirstSeen: flow.FirstSeen,
-			LastSeen:  flow.LastSeen,
-		})
+		fc.timeWindowMutexes[window].Unlock()
 	}
 }
 
@@ -555,73 +633,89 @@ func (fc *FlowCollector) parseNetFlowV9(data []byte, addr *net.UDPAddr) []FlowRe
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	reader := bytes.NewReader(data)
 	var header NetFlowV9Header
-	
+
 	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	if header.Version != NETFLOW_V9 {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	var flows []FlowRecord
-	timestamp := time.Unix(int64(header.UnixSecs), 0)
-	
-	for i := 0; i < int(header.Count); i++ {
+	exportTime := time.Unix(int64(header.UnixSecs), 0)
+
+	for {
+		if reader.Len() < 4 {
+			break
+		}
 		var flowSet NetFlowV9FlowSet
 		if err := binary.Read(reader, binary.BigEndian, &flowSet); err != nil {
 			break
 		}
-		
-		if flowSet.FlowSetID == 0 || flowSet.FlowSetID == 1 {
-			// Template FlowSet - skip for now
-			reader.Seek(int64(flowSet.Length-4), io.SeekCurrent)
-			continue
-		}
-		
-		// Data FlowSet
-		flowData := make([]byte, flowSet.Length-4)
-		if _, err := reader.Read(flowData); err != nil {
+
+		if flowSet.Length < 4 {
 			break
 		}
-		
-		// Simple parsing for common fields
-		if len(flowData) >= 48 {
-			flow := FlowRecord{
-				FirstSeen: timestamp,
-				LastSeen:  timestamp,
+
+		setData := make([]byte, flowSet.Length-4)
+		if _, err := reader.Read(setData); err != nil {
+			break
+		}
+
+		if flowSet.FlowSetID == 0 {
+			// Template flowset
+			continue
+		} else if flowSet.FlowSetID == 1 {
+			// Options template - skip
+			continue
+		} else if flowSet.FlowSetID >= 256 {
+			// Data flowset
+			for len(setData) >= 48 {
+				flow := FlowRecord{
+					FirstSeen: exportTime,
+					LastSeen:  exportTime,
+				}
+
+				// Parse basic fields (this is simplified; real implementation needs template)
+				if len(setData) >= 16 {
+					flow.SrcAddr = net.IP(setData[0:4]).To4()
+					flow.DstAddr = net.IP(setData[4:8]).To4()
+					flow.NextHop = net.IP(setData[8:12]).To4()
+					flow.InputIface = binary.BigEndian.Uint32(setData[12:16])
+				}
+				if len(setData) >= 24 {
+					flow.OutputIface = binary.BigEndian.Uint32(setData[16:20])
+					flow.Packets = uint64(binary.BigEndian.Uint32(setData[20:24]))
+				}
+				if len(setData) >= 28 {
+					flow.Bytes = uint64(binary.BigEndian.Uint32(setData[24:28]))
+				}
+				if len(setData) >= 32 {
+					flow.FirstSeen = exportTime.Add(time.Duration(binary.BigEndian.Uint32(setData[28:32])) * time.Millisecond)
+				}
+				if len(setData) >= 36 {
+					flow.LastSeen = exportTime.Add(time.Duration(binary.BigEndian.Uint32(setData[32:36])) * time.Millisecond)
+				}
+				if len(setData) >= 40 {
+					flow.SrcPort = binary.BigEndian.Uint16(setData[36:38])
+					flow.DstPort = binary.BigEndian.Uint16(setData[38:40])
+				}
+				if len(setData) >= 41 {
+					flow.Protocol = setData[40]
+				}
+
+				flows = append(flows, flow)
+				setData = setData[48:]
 			}
-			
-			// Extract common fields (simplified)
-			if len(flowData) >= 4 {
-				flow.SrcAddr = net.IP(flowData[0:4])
-			}
-			if len(flowData) >= 8 {
-				flow.DstAddr = net.IP(flowData[4:8])
-			}
-			if len(flowData) >= 10 {
-				flow.SrcPort = binary.BigEndian.Uint16(flowData[8:10])
-			}
-			if len(flowData) >= 12 {
-				flow.DstPort = binary.BigEndian.Uint16(flowData[10:12])
-			}
-			if len(flowData) >= 13 {
-				flow.Protocol = flowData[12]
-			}
-			if len(flowData) >= 21 {
-				flow.Bytes = uint64(binary.BigEndian.Uint32(flowData[13:17]))
-				flow.Packets = uint64(binary.BigEndian.Uint32(flowData[17:21]))
-			}
-			
-			flows = append(flows, flow)
 		}
 	}
-	
+
 	return flows
 }
 
@@ -630,72 +724,67 @@ func (fc *FlowCollector) parseIPFIX(data []byte, addr *net.UDPAddr) []FlowRecord
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	reader := bytes.NewReader(data)
 	var header IPFIXHeader
-	
+
 	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	if header.Version != IPFIX_V10 {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	var flows []FlowRecord
-	timestamp := time.Unix(int64(header.ExportTime), 0)
-	
-	// Simplified IPFIX parsing
-	remaining := data[16:]
-	for len(remaining) >= 4 {
-		setID := binary.BigEndian.Uint16(remaining[0:2])
-		length := binary.BigEndian.Uint16(remaining[2:4])
-		
-		if length < 4 || int(length) > len(remaining) {
+	exportTime := time.Unix(int64(header.ExportTime), 0)
+
+	for {
+		if reader.Len() < 4 {
 			break
 		}
-		
+		setID := binary.BigEndian.Uint16(data[reader.Offset : reader.Offset+2])
+		length := binary.BigEndian.Uint16(data[reader.Offset+2 : reader.Offset+4])
+
+		if length < 4 || int(length) > reader.Len() {
+			break
+		}
+
+		setData := data[reader.Offset+4 : reader.Offset+length]
+		reader.Seek(int64(length), io.SeekCurrent)
+
 		if setID >= 256 {
-			// Data Set
-			setData := remaining[4:length]
-			
-			// Simple record parsing
-			if len(setData) >= 48 {
+			// Data set
+			for len(setData) >= 32 {
 				flow := FlowRecord{
-					FirstSeen: timestamp,
-					LastSeen:  timestamp,
+					FirstSeen: exportTime,
+					LastSeen:  exportTime,
 				}
-				
-				// Extract basic fields (simplified)
-				if len(setData) >= 4 {
-					flow.SrcAddr = net.IP(setData[0:4])
+
+				if len(setData) >= 16 {
+					flow.SrcAddr = net.IP(setData[0:4]).To4()
+					flow.DstAddr = net.IP(setData[4:8]).To4()
 				}
-				if len(setData) >= 8 {
-					flow.DstAddr = net.IP(setData[4:8])
+				if len(setData) >= 24 {
+					flow.Bytes = uint64(binary.BigEndian.Uint32(setData[16:20]))
+					flow.Packets = uint64(binary.BigEndian.Uint32(setData[20:24]))
 				}
-				if len(setData) >= 10 {
-					flow.SrcPort = binary.BigEndian.Uint16(setData[8:10])
+				if len(setData) >= 25 {
+					flow.Protocol = setData[24]
 				}
-				if len(setData) >= 12 {
-					flow.DstPort = binary.BigEndian.Uint16(setData[10:12])
+				if len(setData) >= 27 {
+					flow.SrcPort = binary.BigEndian.Uint16(setData[25:27])
+					flow.DstPort = binary.BigEndian.Uint16(setData[27:29])
 				}
-				if len(setData) >= 13 {
-					flow.Protocol = setData[12]
-				}
-				if len(setData) >= 21 {
-					flow.Bytes = uint64(binary.BigEndian.Uint32(setData[13:17]))
-					flow.Packets = uint64(binary.BigEndian.Uint32(setData[17:21]))
-				}
-				
+
 				flows = append(flows, flow)
+				setData = setData[32:]
 			}
 		}
-		
-		remaining = remaining[length:]
 	}
-	
+
 	return flows
 }
 
@@ -704,73 +793,76 @@ func (fc *FlowCollector) parseSFlow(data []byte, addr *net.UDPAddr) []FlowRecord
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	reader := bytes.NewReader(data)
 	var header SFlowHeader
-	
+
 	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	if header.Version != SFLOW_V5 {
 		fc.droppedRecords.Inc()
 		return nil
 	}
-	
+
 	var flows []FlowRecord
-	timestamp := time.Now()
-	
-	// Simplified sFlow parsing
+	baseTime := time.Unix(int64(header.SysUptime)/1000, 0)
+
 	for i := 0; i < int(header.NumSamples); i++ {
-		if reader.Len() < 8 {
+		if reader.Len() < 4 {
 			break
 		}
-		
-		var sampleType, sampleLength uint32
-		binary.Read(reader, binary.BigEndian, &sampleType)
-		binary.Read(reader, binary.BigEndian, &sampleLength)
-		
-		if sampleLength < 8 || int(sampleLength) > reader.Len() {
-			break
-		}
-		
-		sampleData := make([]byte, sampleLength-8)
-		if _, err := reader.Read(sampleData); err != nil {
-			break
-		}
-		
-		// Parse flow sample (simplified)
-		if sampleType == 1 && len(sampleData) >= 24 {
-			flow := FlowRecord{
-				FirstSeen: timestamp,
-				LastSeen:  timestamp,
+		sampleType := binary.BigEndian.Uint32(data[reader.Offset : reader.Offset+4])
+
+		if sampleType == SFLOW_FLOW_SAMPLE || sampleType == SFLOW_EXPANDED_SAMPLE {
+			if reader.Len() < 28 {
+				break
 			}
-			
-			// Extract basic information from sFlow sample
-			sampleReader := bytes.NewReader(sampleData)
-			var sequenceNum, sourceID, samplingRate, samplePool uint32
-			binary.Read(sampleReader, binary.BigEndian, &sequenceNum)
-			binary.Read(sampleReader, binary.BigEndian, &sourceID)
-			binary.Read(sampleReader, binary.BigEndian, &samplingRate)
-			binary.Read(sampleReader, binary.BigEndian, &samplePool)
-			
-			flow.InputIface = sourceID
-			flow.Bytes = uint64(samplingRate * 1500) // Estimate
-			flow.Packets = 1
-			
-			flows = append(flows, flow)
+			var fs SFlowFlowSample
+			binary.Read(reader, binary.BigEndian, &fs)
+
+			if reader.Len() < int(fs.NumRecords)*8 {
+				break
+			}
+
+			for j := 0; j < int(fs.NumRecords); j++ {
+				recordType := binary.BigEndian.Uint32(data[reader.Offset : reader.Offset+4])
+				recordLength := binary.BigEndian.Uint32(data[reader.Offset+4 : reader.Offset+8])
+				reader.Seek(8, io.SeekCurrent)
+
+				if recordType == 1 && recordLength >= 40 { // Raw packet
+					flow := FlowRecord{
+						FirstSeen:      baseTime,
+						LastSeen:       baseTime,
+						InputIface:     fs.InputInterface,
+						OutputInterface: fs.OutputInterface,
+						Packets:        1,
+						Bytes:          1500, // estimate
+					}
+					flows = append(flows, flow)
+				}
+				reader.Seek(int64(recordLength), io.SeekCurrent)
+			}
+		} else {
+			// Skip unknown sample
+			if reader.Len() < 4 {
+				break
+			}
+			length := binary.BigEndian.Uint32(data[reader.Offset+4 : reader.Offset+8])
+			reader.Seek(int64(length), io.SeekCurrent)
 		}
 	}
-	
+
 	return flows
 }
 
 func (fc *FlowCollector) handleUDPConnection(conn *net.UDPConn, protocol string) {
 	defer fc.wg.Done()
-	
+
 	buffer := make([]byte, fc.config.Server.ReadBufferSize)
-	
+
 	for {
 		select {
 		case <-fc.stopChan:
@@ -783,16 +875,16 @@ func (fc *FlowCollector) handleUDPConnection(conn *net.UDPConn, protocol string)
 					continue
 				}
 				if !strings.Contains(err.Error(), "use of closed network connection") {
-					fc.logger.Error("UDP read error", "error", err, "protocol", protocol)
+					fc.logger.Error("UDP read error", "error", err, "protocol", protocol, "remote", addr)
 				}
 				continue
 			}
-			
+
 			fc.receivedPackets.Inc()
-			
+
 			data := make([]byte, n)
 			copy(data, buffer[:n])
-			
+
 			var flows []FlowRecord
 			switch protocol {
 			case "netflow":
@@ -802,8 +894,11 @@ func (fc *FlowCollector) handleUDPConnection(conn *net.UDPConn, protocol string)
 			case "sflow":
 				flows = fc.parseSFlow(data, addr)
 			}
-			
+
 			for _, flow := range flows {
+				if flow.SrcAddr == nil || flow.DstAddr == nil {
+					continue
+				}
 				select {
 				case fc.flowChan <- flow:
 				case <-fc.stopChan:
@@ -821,7 +916,7 @@ func (fc *FlowCollector) startWorkers() {
 		fc.wg.Add(1)
 		go func() {
 			defer fc.wg.Done()
-			
+
 			for {
 				select {
 				case flow := <-fc.flowChan:
@@ -837,7 +932,7 @@ func (fc *FlowCollector) startWorkers() {
 func (fc *FlowCollector) updateQueueMetrics() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
@@ -849,20 +944,24 @@ func (fc *FlowCollector) updateQueueMetrics() {
 }
 
 func (fc *FlowCollector) startAggregationCleaner() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ticker.C:
-			cutoff := time.Now().Add(-1 * time.Hour)
-			fc.aggregatedFlows.Range(func(key, value interface{}) bool {
-				agg := value.(AggregatedFlow)
-				if agg.LastSeen.Before(cutoff) {
-					fc.aggregatedFlows.Delete(key)
+			cutoff := time.Now().Add(-2 * time.Hour)
+			for window, mutex := range fc.timeWindowMutexes {
+				mutex.Lock()
+				m := fc.aggregatedFlows[window]
+				for key, agg := range m {
+					if agg.LastSeen.Before(cutoff) {
+						delete(m, key)
+					}
 				}
-				return true
-			})
+				fc.aggregatedFlows[window] = m
+				mutex.Unlock()
+			}
 		case <-fc.stopChan:
 			return
 		}
@@ -871,16 +970,124 @@ func (fc *FlowCollector) startAggregationCleaner() {
 
 func (fc *FlowCollector) Start() error {
 	fc.logger.Info("Starting Flow Collector")
-	
+
 	// Start workers
 	fc.startWorkers()
-	
+
 	// Start metric updaters
 	go fc.updateQueueMetrics()
 	go fc.startAggregationCleaner()
-	
+
 	// Start UDP listeners
 	for _, listenAddr := range fc.config.Server.ListenAddresses {
 		// NetFlow listener
 		if fc.config.Server.Ports.NetFlow > 0 {
-			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listen
+			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.NetFlow))
+			if err != nil {
+				return err
+			}
+			conn, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				return err
+			}
+			fc.logger.Info("Listening for NetFlow", "address", addr)
+			fc.wg.Add(1)
+			go fc.handleUDPConnection(conn, "netflow")
+		}
+
+		// IPFIX listener
+		if fc.config.Server.Ports.IPFIX > 0 {
+			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.IPFIX))
+			if err != nil {
+				return err
+			}
+			conn, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				return err
+			}
+			fc.logger.Info("Listening for IPFIX", "address", addr)
+			fc.wg.Add(1)
+			go fc.handleUDPConnection(conn, "ipfix")
+		}
+
+		// sFlow listener
+		if fc.config.Server.Ports.SFlow > 0 {
+			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.SFlow))
+			if err != nil {
+				return err
+			}
+			conn, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				return err
+			}
+			fc.logger.Info("Listening for sFlow", "address", addr)
+			fc.wg.Add(1)
+			go fc.handleUDPConnection(conn, "sflow")
+		}
+	}
+
+	// Start metrics server
+	go func() {
+		http.Handle(fc.config.Server.MetricsPath, promhttp.Handler())
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`<html>
+            <head><title>Flow Collector</title></head>
+            <body>
+            <h1>Flow Collector</h1>
+            <p><a href="` + fc.config.Server.MetricsPath + `">Metrics</a></p>
+            </body>
+            </html>`))
+		})
+		fc.logger.Info("Metrics server started", "port", fc.config.Server.MetricsPort, "path", fc.config.Server.MetricsPath)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", fc.config.Server.MetricsPort), nil); err != nil {
+			fc.logger.Error("Metrics server failed", "error", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	<-sigChan
+
+	fc.logger.Info("Shutting down...")
+	close(fc.stopChan)
+	fc.wg.Wait()
+
+	if fc.geoipDB != nil {
+		fc.geoipDB.Close()
+	}
+	if fc.asnDB != nil {
+		fc.asnDB.Close()
+	}
+
+	return nil
+}
+
+func main() {
+	configFile := "config.yaml"
+	if len(os.Args) > 1 {
+		configFile = os.Args[1]
+	}
+
+	if _, err := os.Stat(configFile); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Config file %s not found\n", configFile)
+		os.Exit(1)
+	}
+
+	config, err := loadConfig(configFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	collector, err := NewFlowCollector(config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create collector: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := collector.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Collector failed: %v\n", err)
+		os.Exit(1)
+	}
+}
