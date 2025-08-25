@@ -1,1091 +1,1152 @@
-// main.go
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
+	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/charmbracelet/log"
+	"github.com/netsampler/goflow2/decoders/netflow"
+	"github.com/netsampler/goflow2/decoders/sflow"
+	"github.com/netsampler/goflow2/format"
+	"github.com/netsampler/goflow2/utils"
 	"github.com/oschwald/geoip2-golang"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
 
-// Configuration structures
+// Config structures
 type Config struct {
 	Server struct {
-		ListenAddresses []string `yaml:"listen_addresses"`
-		Ports           struct {
-			NetFlow int `yaml:"netflow"`
-			IPFIX   int `yaml:"ipfix"`
-			SFlow   int `yaml:"sflow"`
-		} `yaml:"ports"`
-		MetricsPort    int    `yaml:"metrics_port"`
-		MetricsPath    string `yaml:"metrics_path"`
-		ReadBufferSize int    `yaml:"read_buffer_size"`
-		Workers        int    `yaml:"workers"`
-		BatchSize      int    `yaml:"batch_size"`
+		NetFlowPort int    `yaml:"netflow_port"`
+		SFlowPort   int    `yaml:"sflow_port"`
+		IPFIXPort   int    `yaml:"ipfix_port"`
+		ListenAddr  string `yaml:"listen_addr"`
+		MetricsPort int    `yaml:"metrics_port"`
+		MetricsPath string `yaml:"metrics_path"`
 	} `yaml:"server"`
-
-	Logging struct {
-		Level      string `yaml:"level"`
-		Structured bool   `yaml:"structured"`
-	} `yaml:"logging"`
-
-	Metrics struct {
-		Namespace string `yaml:"namespace"`
-		Subsystem string `yaml:"subsystem"`
-		Labels    struct {
-			EnableGeoIP bool     `yaml:"enable_geoip"`
-			EnableASN   bool     `yaml:"enable_asn"`
-			Dimensions  []string `yaml:"dimensions"`
-		} `yaml:"labels"`
-	} `yaml:"metrics"`
-
+	
+	Performance struct {
+		BufferSize     int `yaml:"buffer_size"`
+		WorkerCount    int `yaml:"worker_count"`
+		BatchSize      int `yaml:"batch_size"`
+		QueueSize      int `yaml:"queue_size"`
+	} `yaml:"performance"`
+	
 	Aggregation struct {
 		TimeWindows []string `yaml:"time_windows"`
 		Dimensions  []string `yaml:"dimensions"`
 	} `yaml:"aggregation"`
-
-	GeoIP struct {
-		DatabasePath    string `yaml:"database_path"`
-		ASNDatabasePath string `yaml:"asn_database_path"`
-		CacheSize       int    `yaml:"cache_size"`
-		CacheTTL        string `yaml:"cache_ttl"`
-	} `yaml:"geoip"`
+	
+	Enrichment struct {
+		GeoIPEnabled bool   `yaml:"geoip_enabled"`
+		GeoIPPath    string `yaml:"geoip_path"`
+		ASNEnabled   bool   `yaml:"asn_enabled"`
+		ASNPath      string `yaml:"asn_path"`
+		CacheSize    int    `yaml:"cache_size"`
+	} `yaml:"enrichment"`
+	
+	Metrics struct {
+		Namespace     string            `yaml:"namespace"`
+		Subsystem     string            `yaml:"subsystem"`
+		EnabledLabels []string          `yaml:"enabled_labels"`
+		CustomLabels  map[string]string `yaml:"custom_labels"`
+	} `yaml:"metrics"`
+	
+	Logging struct {
+		Level  string `yaml:"level"`
+		Format string `yaml:"format"`
+	} `yaml:"logging"`
 }
 
-// Flow record structures
+// Flow record structure
 type FlowRecord struct {
-	SrcAddr     net.IP
-	DstAddr     net.IP
-	SrcPort     uint16
-	DstPort     uint16
-	Protocol    uint8
-	Bytes       uint64
-	Packets     uint64
-	InputIface  uint32
-	OutputIface uint32
-	FirstSeen   time.Time
-	LastSeen    time.Time
+	SrcAddr      net.IP
+	DstAddr      net.IP
+	SrcPort      uint16
+	DstPort      uint16
+	Protocol     uint8
+	InIf         uint32
+	OutIf        uint32
+	Bytes        uint64
+	Packets      uint64
+	StartTime    time.Time
+	EndTime      time.Time
+	SrcCountry   string
+	DstCountry   string
+	SrcASN       uint32
+	DstASN       uint32
+	SrcASNOrg    string
+	DstASNOrg    string
 }
 
-type FlowKey struct {
-	SrcAddr     string
-	DstAddr     string
-	NextHop     string
-	SrcPort     uint16
-	DstPort     uint16
-	Protocol    uint8
-	InputIface  uint32
-	OutputIface uint32
+// Aggregation key
+type AggKey struct {
+	SrcAddr    string
+	DstAddr    string
+	SrcPort    uint16
+	DstPort    uint16
+	Protocol   uint8
+	InIf       uint32
+	OutIf      uint32
+	SrcCountry string
+	DstCountry string
+	SrcASN     uint32
+	DstASN     uint32
 }
 
-type AggregatedFlow struct {
-	Bytes     uint64
-	Packets   uint64
-	Flows     uint64
-	FirstSeen time.Time
-	LastSeen  time.Time
+// Aggregated metrics
+type AggMetrics struct {
+	Flows   uint64
+	Bytes   uint64
+	Packets uint64
+	LastSeen time.Time
 }
 
-// GeoIP cache entry
-type GeoIPEntry struct {
-	Country string
-	City    string
-	ASN     uint32
-	ASOrg   string
-	Expiry  time.Time
+// GeoIP and ASN cache entry
+type EnrichmentEntry struct {
+	Country   string
+	City      string
+	ASN       uint32
+	ASNOrg    string
+	Timestamp time.Time
 }
 
-// Protocol constants
-const (
-	NETFLOW_V9 = 9
-	IPFIX_V10  = 10
-	SFLOW_V5   = 5
-)
-
-// NetFlow v9 structures
-type NetFlowV9Header struct {
-	Version     uint16
-	Count       uint16
-	SysUptime   uint32
-	UnixSecs    uint32
-	SequenceNum uint32
-	SourceID    uint32
-}
-
-type NetFlowV9FlowSet struct {
-	FlowSetID uint16
-	Length    uint16
-}
-
-type NetFlowV9Template struct {
-	TemplateID uint16
-	FieldCount uint16
-	Fields     []NetFlowV9Field
-}
-
-type NetFlowV9Field struct {
-	Type   uint16
-	Length uint16
-}
-
-// IPFIX structures
-type IPFIXHeader struct {
-	Version             uint16
-	Length              uint16
-	ExportTime          uint32
-	SequenceNum         uint32
-	ObservationDomainID uint32
-}
-
-// sFlow structures
-type SFlowHeader struct {
-	Version      uint32
-	AddressType  uint32
-	AgentAddress [16]byte
-	SubAgentID   uint32
-	SequenceNum  uint32
-	SysUptime    uint32
-	NumSamples   uint32
-}
-
-// SFlow Sample types
-const (
-	SFLOW_FLOW_SAMPLE     = 1
-	SFLOW_COUNTER_SAMPLE  = 2
-	SFLOW_EXPANDED_SAMPLE = 3
-)
-
-type SFlowFlowSample struct {
-	SampleType      uint32
-	SampleLength    uint32
-	SequenceNum     uint32
-	SourceIDType    uint32
-	SourceIDIndex   uint32
-	SamplingRate    uint32
-	SamplePool      uint32
-	DroppedPackets  uint32
-	InputInterface  uint32
-	OutputInterface uint32
-	NumRecords      uint32
-}
-
-// Main collector structure
+// Collector main structure
 type FlowCollector struct {
-	config    *Config
-	logger    *log.Logger
-	geoipDB   *geoip2.Reader
-	asnDB     *geoip2.Reader
-	geoCache  sync.Map
-	templates sync.Map
-
-	// Metrics
-	flowsTotal         *prometheus.CounterVec
-	bytesTotal         *prometheus.CounterVec
-	packetsTotal       *prometheus.CounterVec
-	bandwidthGauge     *prometheus.GaugeVec
-	receivedPackets    prometheus.Counter
-	parsedRecords      prometheus.Counter
-	droppedRecords     prometheus.Counter
-	processingDuration prometheus.Histogram
-	workerQueueLength  prometheus.Gauge
-
-	// Aggregation
-	aggregatedFlows   map[string]map[FlowKey]AggregatedFlow
-	aggregationMutex  sync.RWMutex
-	timeWindowMutexes map[string]*sync.RWMutex
-
-	// Channels
-	flowChan chan FlowRecord
-	stopChan chan struct{}
-	wg       sync.WaitGroup
+	config          *Config
+	logger          *log.Logger
+	geoipDB         *geoip2.Reader
+	asnDB           *geoip2.Reader
+	enrichmentCache sync.Map
+	aggregations    map[string]map[AggKey]*AggMetrics
+	aggMutex        sync.RWMutex
+	
+	// Prometheus metrics
+	flowsTotal          *prometheus.CounterVec
+	bytesTotal          *prometheus.CounterVec
+	packetsTotal        *prometheus.CounterVec
+	bandwidthBps        *prometheus.GaugeVec
+	receivedPackets     prometheus.Counter
+	parsedRecords       prometheus.Counter
+	droppedRecords      prometheus.Counter
+	processingDuration  prometheus.Histogram
+	workerQueueLength   prometheus.Gauge
+	
+	// Worker channels
+	netflowChan chan []byte
+	sflowChan   chan []byte
+	ipfixChan   chan []byte
+	recordChan  chan *FlowRecord
+	
+	// Internal counters
+	receivedCount int64
+	parsedCount   int64
+	droppedCount  int64
+	
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
+// Initialize collector
+func NewFlowCollector(configPath string) (*FlowCollector, error) {
+	// Load configuration
+	config, err := loadConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+	
+	// Setup logger
+	logger := log.New(os.Stdout)
+	level := log.InfoLevel
+	switch strings.ToLower(config.Logging.Level) {
+	case "debug":
+		level = log.DebugLevel
+	case "info":
+		level = log.InfoLevel
+	case "warn":
+		level = log.WarnLevel
+	case "error":
+		level = log.ErrorLevel
+	}
+	logger.SetLevel(level)
+	
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	collector := &FlowCollector{
+		config:          config,
+		logger:          logger,
+		aggregations:    make(map[string]map[AggKey]*AggMetrics),
+		netflowChan:     make(chan []byte, config.Performance.QueueSize),
+		sflowChan:       make(chan []byte, config.Performance.QueueSize),
+		ipfixChan:       make(chan []byte, config.Performance.QueueSize),
+		recordChan:      make(chan *FlowRecord, config.Performance.QueueSize*10),
+		ctx:             ctx,
+		cancel:          cancel,
+	}
+	
+	// Initialize aggregation windows
+	for _, window := range config.Aggregation.TimeWindows {
+		collector.aggregations[window] = make(map[AggKey]*AggMetrics)
+	}
+	
+	// Setup GeoIP databases
+	if err := collector.setupEnrichment(); err != nil {
+		collector.logger.Warn("Failed to setup enrichment", "error", err)
+	}
+	
+	// Setup Prometheus metrics
+	collector.setupPrometheusMetrics()
+	
+	return collector, nil
+}
+
+// Load configuration from YAML
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
+	
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-
+	
 	// Set defaults
-	if config.Server.MetricsPort == 0 {
-		config.Server.MetricsPort = 8080
+	if config.Server.ListenAddr == "" {
+		config.Server.ListenAddr = "0.0.0.0"
 	}
 	if config.Server.MetricsPath == "" {
 		config.Server.MetricsPath = "/metrics"
 	}
-	if config.Server.ReadBufferSize == 0 {
-		config.Server.ReadBufferSize = 8192
+	if config.Performance.BufferSize == 0 {
+		config.Performance.BufferSize = 65536
 	}
-	if config.Server.Workers == 0 {
-		config.Server.Workers = 4
+	if config.Performance.WorkerCount == 0 {
+		config.Performance.WorkerCount = 4
 	}
-	if config.Server.BatchSize == 0 {
-		config.Server.BatchSize = 100
+	if config.Performance.BatchSize == 0 {
+		config.Performance.BatchSize = 100
+	}
+	if config.Performance.QueueSize == 0 {
+		config.Performance.QueueSize = 1000
+	}
+	if config.Enrichment.CacheSize == 0 {
+		config.Enrichment.CacheSize = 10000
 	}
 	if config.Metrics.Namespace == "" {
 		config.Metrics.Namespace = "flow"
 	}
-	if config.Metrics.Subsystem == "" {
-		config.Metrics.Subsystem = "collector"
-	}
-	if len(config.Aggregation.TimeWindows) == 0 {
-		config.Aggregation.TimeWindows = []string{"1m", "5m", "15m", "1h"}
-	}
-	if config.GeoIP.CacheTTL == "" {
-		config.GeoIP.CacheTTL = "1h"
-	}
-	if config.GeoIP.CacheSize == 0 {
-		config.GeoIP.CacheSize = 10000
-	}
-
+	
 	return &config, nil
 }
 
-func NewFlowCollector(config *Config) (*FlowCollector, error) {
-	logger := log.New(os.Stdout)
-	if config.Logging.Structured {
-		logger.SetReportCaller(false)
-		logger.SetTimeFormat(time.Kitchen)
-	}
-
-	// Set log level
-	switch strings.ToLower(config.Logging.Level) {
-	case "debug":
-		logger.SetLevel(log.DebugLevel)
-	case "info":
-		logger.SetLevel(log.InfoLevel)
-	case "warn":
-		logger.SetLevel(log.WarnLevel)
-	case "error":
-		logger.SetLevel(log.ErrorLevel)
-	default:
-		logger.SetLevel(log.InfoLevel)
-	}
-
-	collector := &FlowCollector{
-		config:            config,
-		logger:            logger,
-		flowChan:          make(chan FlowRecord, config.Server.BatchSize*10),
-		stopChan:          make(chan struct{}),
-		aggregatedFlows:   make(map[string]map[FlowKey]AggregatedFlow),
-		timeWindowMutexes: make(map[string]*sync.RWMutex),
-	}
-
-	// Initialize time window maps
-	for _, window := range config.Aggregation.TimeWindows {
-		collector.aggregatedFlows[window] = make(map[FlowKey]AggregatedFlow)
-		collector.timeWindowMutexes[window] = &sync.RWMutex{}
-	}
-
-	// Initialize GeoIP databases
-	if config.Metrics.Labels.EnableGeoIP && config.GeoIP.DatabasePath != "" {
-		db, err := geoip2.Open(config.GeoIP.DatabasePath)
+// Setup GeoIP and ASN databases
+func (fc *FlowCollector) setupEnrichment() error {
+	if fc.config.Enrichment.GeoIPEnabled && fc.config.Enrichment.GeoIPPath != "" {
+		db, err := geoip2.Open(fc.config.Enrichment.GeoIPPath)
 		if err != nil {
-			logger.Warn("Failed to open GeoIP database", "error", err, "path", config.GeoIP.DatabasePath)
-		} else {
-			collector.geoipDB = db
-			logger.Info("GeoIP database loaded", "path", config.GeoIP.DatabasePath)
+			return fmt.Errorf("failed to open GeoIP database: %w", err)
 		}
+		fc.geoipDB = db
+		fc.logger.Info("GeoIP database loaded", "path", fc.config.Enrichment.GeoIPPath)
 	}
-
-	if config.Metrics.Labels.EnableASN && config.GeoIP.ASNDatabasePath != "" {
-		db, err := geoip2.Open(config.GeoIP.ASNDatabasePath)
+	
+	if fc.config.Enrichment.ASNEnabled && fc.config.Enrichment.ASNPath != "" {
+		db, err := geoip2.Open(fc.config.Enrichment.ASNPath)
 		if err != nil {
-			logger.Warn("Failed to open ASN database", "error", err, "path", config.GeoIP.ASNDatabasePath)
-		} else {
-			collector.asnDB = db
-			logger.Info("ASN database loaded", "path", config.GeoIP.ASNDatabasePath)
+			return fmt.Errorf("failed to open ASN database: %w", err)
 		}
+		fc.asnDB = db
+		fc.logger.Info("ASN database loaded", "path", fc.config.Enrichment.ASNPath)
 	}
-
-	// Initialize Prometheus metrics
-	collector.initMetrics()
-
-	return collector, nil
+	
+	return nil
 }
 
-func (fc *FlowCollector) initMetrics() {
-	labels := []string{"protocol"}
-
-	// Add optional labels based on configuration
-	validDims := map[string]bool{"src_port": true, "dst_port": true, "input_iface": true, "output_iface": true}
-	for _, dim := range fc.config.Metrics.Labels.Dimensions {
-		if validDims[dim] {
-			labels = append(labels, dim)
-		}
+// Setup Prometheus metrics
+func (fc *FlowCollector) setupPrometheusMetrics() {
+	namespace := fc.config.Metrics.Namespace
+	subsystem := fc.config.Metrics.Subsystem
+	
+	labelNames := []string{"src_addr", "dst_addr", "protocol"}
+	if contains(fc.config.Metrics.EnabledLabels, "ports") {
+		labelNames = append(labelNames, "src_port", "dst_port")
 	}
-
-	if fc.config.Metrics.Labels.EnableGeoIP {
-		labels = append(labels, "src_country", "dst_country")
+	if contains(fc.config.Metrics.EnabledLabels, "interfaces") {
+		labelNames = append(labelNames, "in_if", "out_if")
 	}
-
-	if fc.config.Metrics.Labels.EnableASN {
-		labels = append(labels, "src_asn", "dst_asn")
+	if contains(fc.config.Metrics.EnabledLabels, "geo") {
+		labelNames = append(labelNames, "src_country", "dst_country")
 	}
-
+	if contains(fc.config.Metrics.EnabledLabels, "asn") {
+		labelNames = append(labelNames, "src_asn", "dst_asn")
+	}
+	
 	fc.flowsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "flows_total",
-			Help:      "Total number of flows processed",
+			Help:      "Total number of flows",
 		},
-		labels,
+		labelNames,
 	)
-
+	
 	fc.bytesTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "bytes_total",
-			Help:      "Total number of bytes processed",
+			Help:      "Total number of bytes",
 		},
-		labels,
+		labelNames,
 	)
-
+	
 	fc.packetsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "packets_total",
-			Help:      "Total number of packets processed",
+			Help:      "Total number of packets",
 		},
-		labels,
+		labelNames,
 	)
-
-	fc.bandwidthGauge = prometheus.NewGaugeVec(
+	
+	fc.bandwidthBps = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "bandwidth_bps",
-			Help:      "Bandwidth utilization in bits per second",
+			Help:      "Current bandwidth in bits per second",
 		},
-		[]string{"direction", "interface"},
+		labelNames,
 	)
-
-	// System metrics
+	
 	fc.receivedPackets = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "received_packets_total",
 			Help:      "Total number of received raw packets",
 		},
 	)
-
+	
 	fc.parsedRecords = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "parsed_records_total",
 			Help:      "Total number of successfully parsed flow records",
 		},
 	)
-
+	
 	fc.droppedRecords = prometheus.NewCounter(
 		prometheus.CounterOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "dropped_records_total",
-			Help:      "Total number of dropped or failed records",
+			Help:      "Total number of dropped/failed records",
 		},
 	)
-
+	
 	fc.processingDuration = prometheus.NewHistogram(
 		prometheus.HistogramOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "processing_duration_seconds",
-			Help:      "Processing duration in seconds",
+			Help:      "Time spent processing flow records",
 			Buckets:   prometheus.DefBuckets,
 		},
 	)
-
+	
 	fc.workerQueueLength = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Namespace: fc.config.Metrics.Namespace,
-			Subsystem: fc.config.Metrics.Subsystem,
+			Namespace: namespace,
+			Subsystem: subsystem,
 			Name:      "worker_queue_length",
 			Help:      "Current length of worker processing queue",
 		},
 	)
-
+	
 	// Register metrics
-	prometheus.MustRegister(fc.flowsTotal)
-	prometheus.MustRegister(fc.bytesTotal)
-	prometheus.MustRegister(fc.packetsTotal)
-	prometheus.MustRegister(fc.bandwidthGauge)
-	prometheus.MustRegister(fc.receivedPackets)
-	prometheus.MustRegister(fc.parsedRecords)
-	prometheus.MustRegister(fc.droppedRecords)
-	prometheus.MustRegister(fc.processingDuration)
-	prometheus.MustRegister(fc.workerQueueLength)
+	prometheus.MustRegister(
+		fc.flowsTotal,
+		fc.bytesTotal,
+		fc.packetsTotal,
+		fc.bandwidthBps,
+		fc.receivedPackets,
+		fc.parsedRecords,
+		fc.droppedRecords,
+		fc.processingDuration,
+		fc.workerQueueLength,
+	)
 }
 
-func (fc *FlowCollector) getGeoInfo(ip net.IP) (country, city string, asn uint32, asOrg string) {
-	if ip == nil || ip.IsUnspecified() {
-		return "", "", 0, ""
+// Start the collector
+func (fc *FlowCollector) Start() error {
+	fc.logger.Info("Starting flow collector")
+	
+	// Start UDP listeners
+	go fc.startUDPListener("netflow", fc.config.Server.NetFlowPort, fc.netflowChan)
+	go fc.startUDPListener("sflow", fc.config.Server.SFlowPort, fc.sflowChan)
+	go fc.startUDPListener("ipfix", fc.config.Server.IPFIXPort, fc.ipfixChan)
+	
+	// Start protocol workers
+	go fc.startNetFlowWorker()
+	go fc.startSFlowWorker()
+	go fc.startIPFIXWorker()
+	
+	// Start record processors
+	for i := 0; i < fc.config.Performance.WorkerCount; i++ {
+		go fc.recordProcessor()
 	}
-
-	ipStr := ip.String()
-
-	// Check cache first
-	if cached, ok := fc.geoCache.Load(ipStr); ok {
-		entry := cached.(GeoIPEntry)
-		if time.Now().Before(entry.Expiry) {
-			return entry.Country, entry.City, entry.ASN, entry.ASOrg
-		}
-		fc.geoCache.Delete(ipStr)
-	}
-
-	// Query GeoIP database
-	if fc.geoipDB != nil {
-		if record, err := fc.geoipDB.City(ip); err == nil {
-			if record.Country.IsoCode != "" {
-				country = record.Country.IsoCode
-			}
-			if record.City.Names["en"] != "" {
-				city = record.City.Names["en"]
-			}
-		}
-	}
-
-	// Query ASN database
-	if fc.asnDB != nil {
-		if record, err := fc.asnDB.ASN(ip); err == nil {
-			asn = uint32(record.AutonomousSystemNumber)
-			asOrg = record.AutonomousSystemOrganization
-		}
-	}
-
-	// Cache the result
-	cacheTTL := 1 * time.Hour
-	if fc.config.GeoIP.CacheTTL != "" {
-		if duration, err := time.ParseDuration(fc.config.GeoIP.CacheTTL); err == nil {
-			cacheTTL = duration
-		}
-	}
-
-	entry := GeoIPEntry{
-		Country: country,
-		City:    city,
-		ASN:     asn,
-		ASOrg:   asOrg,
-		Expiry:  time.Now().Add(cacheTTL),
-	}
-	fc.geoCache.Store(ipStr, entry)
-
-	// Enforce cache size limit (LRU approximation via random eviction)
-	var count int
-	fc.geoCache.Range(func(_, _ interface{}) bool {
-		count++
-		return true
-	})
-	if count > fc.config.GeoIP.CacheSize {
-		// Trigger cleanup of expired entries
-		now := time.Now()
-		fc.geoCache.Range(func(key, value interface{}) bool {
-			if value.(GeoIPEntry).Expiry.Before(now) {
-				fc.geoCache.Delete(key)
-			}
-			return true
-		})
-	}
-
-	return country, city, asn, asOrg
+	
+	// Start aggregation cleanup
+	go fc.aggregationCleanup()
+	
+	// Start metrics updater
+	go fc.metricsUpdater()
+	
+	// Start HTTP server for metrics
+	go fc.startMetricsServer()
+	
+	return nil
 }
 
-func (fc *FlowCollector) buildLabels(flow FlowRecord) prometheus.Labels {
-	labels := prometheus.Labels{
-		"protocol": strconv.Itoa(int(flow.Protocol)),
+// Start UDP listener
+func (fc *FlowCollector) startUDPListener(protocol string, port int, ch chan<- []byte) {
+	if port == 0 {
+		fc.logger.Warn("Port not configured for protocol", "protocol", protocol)
+		return
 	}
-
-	// Add dimensional labels
-	for _, dim := range fc.config.Metrics.Labels.Dimensions {
-		switch dim {
-		case "src_port":
-			labels["src_port"] = strconv.Itoa(int(flow.SrcPort))
-		case "dst_port":
-			labels["dst_port"] = strconv.Itoa(int(flow.DstPort))
-		case "input_iface":
-			labels["input_iface"] = strconv.Itoa(int(flow.InputIface))
-		case "output_iface":
-			labels["output_iface"] = strconv.Itoa(int(flow.OutputIface))
+	
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", fc.config.Server.ListenAddr, port))
+	if err != nil {
+		fc.logger.Error("Failed to resolve UDP address", "protocol", protocol, "error", err)
+		return
+	}
+	
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		fc.logger.Error("Failed to listen on UDP", "protocol", protocol, "error", err)
+		return
+	}
+	defer conn.Close()
+	
+	fc.logger.Info("UDP listener started", "protocol", protocol, "address", addr)
+	
+	buffer := make([]byte, fc.config.Performance.BufferSize)
+	
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		default:
+			n, _, err := conn.ReadFromUDP(buffer)
+			if err != nil {
+				fc.logger.Error("UDP read error", "protocol", protocol, "error", err)
+				continue
+			}
+			
+			atomic.AddInt64(&fc.receivedCount, 1)
+			fc.receivedPackets.Inc()
+			
+			// Copy data to avoid buffer reuse issues
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			
+			select {
+			case ch <- data:
+			default:
+				atomic.AddInt64(&fc.droppedCount, 1)
+				fc.droppedRecords.Inc()
+				fc.logger.Warn("Channel full, dropping packet", "protocol", protocol)
+			}
 		}
 	}
-
-	// Add GeoIP labels
-	if fc.config.Metrics.Labels.EnableGeoIP {
-		srcCountry, _, _, _ := fc.getGeoInfo(flow.SrcAddr)
-		dstCountry, _, _, _ := fc.getGeoInfo(flow.DstAddr)
-		labels["src_country"] = srcCountry
-		labels["dst_country"] = dstCountry
-	}
-
-	// Add ASN labels
-	if fc.config.Metrics.Labels.EnableASN {
-		_, _, srcASN, _ := fc.getGeoInfo(flow.SrcAddr)
-		_, _, dstASN, _ := fc.getGeoInfo(flow.DstAddr)
-		if srcASN > 0 {
-			labels["src_asn"] = fmt.Sprintf("AS%d", srcASN)
-		}
-		if dstASN > 0 {
-			labels["dst_asn"] = fmt.Sprintf("AS%d", dstASN)
-		}
-	}
-
-	return labels
 }
 
-func (fc *FlowCollector) processFlow(flow FlowRecord) {
+// NetFlow worker
+func (fc *FlowCollector) startNetFlowWorker() {
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case data := <-fc.netflowChan:
+			fc.processNetFlowPacket(data)
+		}
+	}
+}
+
+// SFlow worker
+func (fc *FlowCollector) startSFlowWorker() {
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case data := <-fc.sflowChan:
+			fc.processSFlowPacket(data)
+		}
+	}
+}
+
+// IPFIX worker
+func (fc *FlowCollector) startIPFIXWorker() {
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case data := <-fc.ipfixChan:
+			fc.processIPFIXPacket(data)
+		}
+	}
+}
+
+// Process NetFlow packet
+func (fc *FlowCollector) processNetFlowPacket(data []byte) {
 	start := time.Now()
 	defer func() {
 		fc.processingDuration.Observe(time.Since(start).Seconds())
 	}()
-
-	labels := fc.buildLabels(flow)
-
-	fc.flowsTotal.With(labels).Inc()
-	fc.bytesTotal.With(labels).Add(float64(flow.Bytes))
-	fc.packetsTotal.With(labels).Add(float64(flow.Packets))
-
-	fc.parsedRecords.Inc()
-
-	// Update bandwidth metrics
-	duration := flow.LastSeen.Sub(flow.FirstSeen).Seconds()
-	if duration > 0 {
-		bps := float64(flow.Bytes*8) / duration
-		if flow.InputIface > 0 {
-			fc.bandwidthGauge.WithLabelValues("in", strconv.Itoa(int(flow.InputIface))).Set(bps)
-		}
-		if flow.OutputIface > 0 {
-			fc.bandwidthGauge.WithLabelValues("out", strconv.Itoa(int(flow.OutputIface))).Set(bps)
-		}
-	}
-
-	// Aggregate flows
-	fc.aggregateFlow(flow)
-}
-
-func (fc *FlowCollector) aggregateFlow(flow FlowRecord) {
-	key := FlowKey{
-		SrcAddr:     flow.SrcAddr.String(),
-		DstAddr:     flow.DstAddr.String(),
-		NextHop:     flow.NextHop,
-		SrcPort:     flow.SrcPort,
-		DstPort:     flow.DstPort,
-		Protocol:    flow.Protocol,
-		InputIface:  flow.InputIface,
-		OutputIface: flow.OutputIface,
-	}
-
-	for _, window := range fc.config.Aggregation.TimeWindows {
-		fc.timeWindowMutexes[window].Lock()
-		m := fc.aggregatedFlows[window]
-		if existing, ok := m[key]; ok {
-			existing.Bytes += flow.Bytes
-			existing.Packets += flow.Packets
-			existing.Flows++
-			if flow.FirstSeen.Before(existing.FirstSeen) {
-				existing.FirstSeen = flow.FirstSeen
-			}
-			if flow.LastSeen.After(existing.LastSeen) {
-				existing.LastSeen = flow.LastSeen
-			}
-			m[key] = existing
-		} else {
-			m[key] = AggregatedFlow{
-				Bytes:     flow.Bytes,
-				Packets:   flow.Packets,
-				Flows:     1,
-				FirstSeen: flow.FirstSeen,
-				LastSeen:  flow.LastSeen,
-			}
-		}
-		fc.timeWindowMutexes[window].Unlock()
-	}
-}
-
-func (fc *FlowCollector) parseNetFlowV9(data []byte, addr *net.UDPAddr) []FlowRecord {
-	if len(data) < 20 {
+	
+	// Decode NetFlow packet
+	packet, err := netflow.DecodeMessage(data)
+	if err != nil {
+		fc.logger.Debug("Failed to decode NetFlow packet", "error", err)
+		atomic.AddInt64(&fc.droppedCount, 1)
 		fc.droppedRecords.Inc()
-		return nil
+		return
 	}
-
-	reader := bytes.NewReader(data)
-	var header NetFlowV9Header
-
-	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	if header.Version != NETFLOW_V9 {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	var flows []FlowRecord
-	exportTime := time.Unix(int64(header.UnixSecs), 0)
-
-	for {
-		if reader.Len() < 4 {
-			break
-		}
-		var flowSet NetFlowV9FlowSet
-		if err := binary.Read(reader, binary.BigEndian, &flowSet); err != nil {
-			break
-		}
-
-		if flowSet.Length < 4 {
-			break
-		}
-
-		setData := make([]byte, flowSet.Length-4)
-		if _, err := reader.Read(setData); err != nil {
-			break
-		}
-
-		if flowSet.FlowSetID == 0 {
-			// Template flowset
-			continue
-		} else if flowSet.FlowSetID == 1 {
-			// Options template - skip
-			continue
-		} else if flowSet.FlowSetID >= 256 {
-			// Data flowset
-			for len(setData) >= 48 {
-				flow := FlowRecord{
-					FirstSeen: exportTime,
-					LastSeen:  exportTime,
-				}
-
-				// Parse basic fields (this is simplified; real implementation needs template)
-				if len(setData) >= 16 {
-					flow.SrcAddr = net.IP(setData[0:4]).To4()
-					flow.DstAddr = net.IP(setData[4:8]).To4()
-					flow.NextHop = net.IP(setData[8:12]).To4()
-					flow.InputIface = binary.BigEndian.Uint32(setData[12:16])
-				}
-				if len(setData) >= 24 {
-					flow.OutputIface = binary.BigEndian.Uint32(setData[16:20])
-					flow.Packets = uint64(binary.BigEndian.Uint32(setData[20:24]))
-				}
-				if len(setData) >= 28 {
-					flow.Bytes = uint64(binary.BigEndian.Uint32(setData[24:28]))
-				}
-				if len(setData) >= 32 {
-					flow.FirstSeen = exportTime.Add(time.Duration(binary.BigEndian.Uint32(setData[28:32])) * time.Millisecond)
-				}
-				if len(setData) >= 36 {
-					flow.LastSeen = exportTime.Add(time.Duration(binary.BigEndian.Uint32(setData[32:36])) * time.Millisecond)
-				}
-				if len(setData) >= 40 {
-					flow.SrcPort = binary.BigEndian.Uint16(setData[36:38])
-					flow.DstPort = binary.BigEndian.Uint16(setData[38:40])
-				}
-				if len(setData) >= 41 {
-					flow.Protocol = setData[40]
-				}
-
-				flows = append(flows, flow)
-				setData = setData[48:]
-			}
-		}
-	}
-
-	return flows
-}
-
-func (fc *FlowCollector) parseIPFIX(data []byte, addr *net.UDPAddr) []FlowRecord {
-	if len(data) < 16 {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	reader := bytes.NewReader(data)
-	var header IPFIXHeader
-
-	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	if header.Version != IPFIX_V10 {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	var flows []FlowRecord
-	exportTime := time.Unix(int64(header.ExportTime), 0)
-
-	for {
-		if reader.Len() < 4 {
-			break
-		}
-		setID := binary.BigEndian.Uint16(data[reader.Offset : reader.Offset+2])
-		length := binary.BigEndian.Uint16(data[reader.Offset+2 : reader.Offset+4])
-
-		if length < 4 || int(length) > reader.Len() {
-			break
-		}
-
-		setData := data[reader.Offset+4 : reader.Offset+length]
-		reader.Seek(int64(length), io.SeekCurrent)
-
-		if setID >= 256 {
-			// Data set
-			for len(setData) >= 32 {
-				flow := FlowRecord{
-					FirstSeen: exportTime,
-					LastSeen:  exportTime,
-				}
-
-				if len(setData) >= 16 {
-					flow.SrcAddr = net.IP(setData[0:4]).To4()
-					flow.DstAddr = net.IP(setData[4:8]).To4()
-				}
-				if len(setData) >= 24 {
-					flow.Bytes = uint64(binary.BigEndian.Uint32(setData[16:20]))
-					flow.Packets = uint64(binary.BigEndian.Uint32(setData[20:24]))
-				}
-				if len(setData) >= 25 {
-					flow.Protocol = setData[24]
-				}
-				if len(setData) >= 27 {
-					flow.SrcPort = binary.BigEndian.Uint16(setData[25:27])
-					flow.DstPort = binary.BigEndian.Uint16(setData[27:29])
-				}
-
-				flows = append(flows, flow)
-				setData = setData[32:]
-			}
-		}
-	}
-
-	return flows
-}
-
-func (fc *FlowCollector) parseSFlow(data []byte, addr *net.UDPAddr) []FlowRecord {
-	if len(data) < 28 {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	reader := bytes.NewReader(data)
-	var header SFlowHeader
-
-	if err := binary.Read(reader, binary.BigEndian, &header); err != nil {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	if header.Version != SFLOW_V5 {
-		fc.droppedRecords.Inc()
-		return nil
-	}
-
-	var flows []FlowRecord
-	baseTime := time.Unix(int64(header.SysUptime)/1000, 0)
-
-	for i := 0; i < int(header.NumSamples); i++ {
-		if reader.Len() < 4 {
-			break
-		}
-		sampleType := binary.BigEndian.Uint32(data[reader.Offset : reader.Offset+4])
-
-		if sampleType == SFLOW_FLOW_SAMPLE || sampleType == SFLOW_EXPANDED_SAMPLE {
-			if reader.Len() < 28 {
-				break
-			}
-			var fs SFlowFlowSample
-			binary.Read(reader, binary.BigEndian, &fs)
-
-			if reader.Len() < int(fs.NumRecords)*8 {
-				break
-			}
-
-			for j := 0; j < int(fs.NumRecords); j++ {
-				recordType := binary.BigEndian.Uint32(data[reader.Offset : reader.Offset+4])
-				recordLength := binary.BigEndian.Uint32(data[reader.Offset+4 : reader.Offset+8])
-				reader.Seek(8, io.SeekCurrent)
-
-				if recordType == 1 && recordLength >= 40 { // Raw packet
-					flow := FlowRecord{
-						FirstSeen:       baseTime,
-						LastSeen:        baseTime,
-						InputIface:      fs.InputInterface,
-						OutputInterface: fs.OutputInterface,
-						Packets:         1,
-						Bytes:           1500, // estimate
-					}
-					flows = append(flows, flow)
-				}
-				reader.Seek(int64(recordLength), io.SeekCurrent)
-			}
-		} else {
-			// Skip unknown sample
-			if reader.Len() < 4 {
-				break
-			}
-			length := binary.BigEndian.Uint32(data[reader.Offset+4 : reader.Offset+8])
-			reader.Seek(int64(length), io.SeekCurrent)
-		}
-	}
-
-	return flows
-}
-
-func (fc *FlowCollector) handleUDPConnection(conn *net.UDPConn, protocol string) {
-	defer fc.wg.Done()
-
-	buffer := make([]byte, fc.config.Server.ReadBufferSize)
-
-	for {
+	
+	// Convert to flow records
+	records := fc.convertNetFlowToRecords(packet)
+	for _, record := range records {
 		select {
-		case <-fc.stopChan:
-			return
+		case fc.recordChan <- record:
+			atomic.AddInt64(&fc.parsedCount, 1)
+			fc.parsedRecords.Inc()
 		default:
-			conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-			n, addr, err := conn.ReadFromUDP(buffer)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				if !strings.Contains(err.Error(), "use of closed network connection") {
-					fc.logger.Error("UDP read error", "error", err, "protocol", protocol, "remote", addr)
-				}
-				continue
-			}
-
-			fc.receivedPackets.Inc()
-
-			data := make([]byte, n)
-			copy(data, buffer[:n])
-
-			var flows []FlowRecord
-			switch protocol {
-			case "netflow":
-				flows = fc.parseNetFlowV9(data, addr)
-			case "ipfix":
-				flows = fc.parseIPFIX(data, addr)
-			case "sflow":
-				flows = fc.parseSFlow(data, addr)
-			}
-
-			for _, flow := range flows {
-				if flow.SrcAddr == nil || flow.DstAddr == nil {
-					continue
-				}
-				select {
-				case fc.flowChan <- flow:
-				case <-fc.stopChan:
-					return
-				default:
-					fc.droppedRecords.Inc()
-				}
-			}
+			atomic.AddInt64(&fc.droppedCount, 1)
+			fc.droppedRecords.Inc()
 		}
 	}
 }
 
-func (fc *FlowCollector) startWorkers() {
-	for i := 0; i < fc.config.Server.Workers; i++ {
-		fc.wg.Add(1)
-		go func() {
-			defer fc.wg.Done()
-
-			for {
-				select {
-				case flow := <-fc.flowChan:
-					fc.processFlow(flow)
-				case <-fc.stopChan:
-					return
-				}
-			}
-		}()
-	}
-}
-
-func (fc *FlowCollector) updateQueueMetrics() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			fc.workerQueueLength.Set(float64(len(fc.flowChan)))
-		case <-fc.stopChan:
-			return
-		}
-	}
-}
-
-func (fc *FlowCollector) startAggregationCleaner() {
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			cutoff := time.Now().Add(-2 * time.Hour)
-			for window, mutex := range fc.timeWindowMutexes {
-				mutex.Lock()
-				m := fc.aggregatedFlows[window]
-				for key, agg := range m {
-					if agg.LastSeen.Before(cutoff) {
-						delete(m, key)
-					}
-				}
-				fc.aggregatedFlows[window] = m
-				mutex.Unlock()
-			}
-		case <-fc.stopChan:
-			return
-		}
-	}
-}
-
-func (fc *FlowCollector) Start() error {
-	fc.logger.Info("Starting Flow Collector")
-
-	// Start workers
-	fc.startWorkers()
-
-	// Start metric updaters
-	go fc.updateQueueMetrics()
-	go fc.startAggregationCleaner()
-
-	// Start UDP listeners
-	for _, listenAddr := range fc.config.Server.ListenAddresses {
-		// NetFlow listener
-		if fc.config.Server.Ports.NetFlow > 0 {
-			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.NetFlow))
-			if err != nil {
-				return err
-			}
-			conn, err := net.ListenUDP("udp", addr)
-			if err != nil {
-				return err
-			}
-			fc.logger.Info("Listening for NetFlow", "address", addr)
-			fc.wg.Add(1)
-			go fc.handleUDPConnection(conn, "netflow")
-		}
-
-		// IPFIX listener
-		if fc.config.Server.Ports.IPFIX > 0 {
-			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.IPFIX))
-			if err != nil {
-				return err
-			}
-			conn, err := net.ListenUDP("udp", addr)
-			if err != nil {
-				return err
-			}
-			fc.logger.Info("Listening for IPFIX", "address", addr)
-			fc.wg.Add(1)
-			go fc.handleUDPConnection(conn, "ipfix")
-		}
-
-		// sFlow listener
-		if fc.config.Server.Ports.SFlow > 0 {
-			addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", listenAddr, fc.config.Server.Ports.SFlow))
-			if err != nil {
-				return err
-			}
-			conn, err := net.ListenUDP("udp", addr)
-			if err != nil {
-				return err
-			}
-			fc.logger.Info("Listening for sFlow", "address", addr)
-			fc.wg.Add(1)
-			go fc.handleUDPConnection(conn, "sflow")
-		}
-	}
-
-	// Start metrics server
-	go func() {
-		http.Handle(fc.config.Server.MetricsPath, promhttp.Handler())
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.Write([]byte(`<html>
-            <head><title>Flow Collector</title></head>
-            <body>
-            <h1>Flow Collector</h1>
-            <p><a href="` + fc.config.Server.MetricsPath + `">Metrics</a></p>
-            </body>
-            </html>`))
-		})
-		fc.logger.Info("Metrics server started", "port", fc.config.Server.MetricsPort, "path", fc.config.Server.MetricsPath)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", fc.config.Server.MetricsPort), nil); err != nil {
-			fc.logger.Error("Metrics server failed", "error", err)
-		}
+// Process SFlow packet
+func (fc *FlowCollector) processSFlowPacket(data []byte) {
+	start := time.Now()
+	defer func() {
+		fc.processingDuration.Observe(time.Since(start).Seconds())
 	}()
+	
+	// Decode SFlow packet
+	packet, err := sflow.DecodeMessage(data)
+	if err != nil {
+		fc.logger.Debug("Failed to decode SFlow packet", "error", err)
+		atomic.AddInt64(&fc.droppedCount, 1)
+		fc.droppedRecords.Inc()
+		return
+	}
+	
+	// Convert to flow records
+	records := fc.convertSFlowToRecords(packet)
+	for _, record := range records {
+		select {
+		case fc.recordChan <- record:
+			atomic.AddInt64(&fc.parsedCount, 1)
+			fc.parsedRecords.Inc()
+		default:
+			atomic.AddInt64(&fc.droppedCount, 1)
+			fc.droppedRecords.Inc()
+		}
+	}
+}
 
-	// Wait for interrupt signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+// Process IPFIX packet (using NetFlow decoder as IPFIX is similar)
+func (fc *FlowCollector) processIPFIXPacket(data []byte) {
+	start := time.Now()
+	defer func() {
+		fc.processingDuration.Observe(time.Since(start).Seconds())
+	}()
+	
+	// Decode IPFIX packet (using NetFlow decoder)
+	packet, err := netflow.DecodeMessage(data)
+	if err != nil {
+		fc.logger.Debug("Failed to decode IPFIX packet", "error", err)
+		atomic.AddInt64(&fc.droppedCount, 1)
+		fc.droppedRecords.Inc()
+		return
+	}
+	
+	// Convert to flow records
+	records := fc.convertNetFlowToRecords(packet)
+	for _, record := range records {
+		select {
+		case fc.recordChan <- record:
+			atomic.AddInt64(&fc.parsedCount, 1)
+			fc.parsedRecords.Inc()
+		default:
+			atomic.AddInt64(&fc.droppedCount, 1)
+			fc.droppedRecords.Inc()
+		}
+	}
+}
 
-	fc.logger.Info("Shutting down...")
-	close(fc.stopChan)
-	fc.wg.Wait()
+// Convert NetFlow to flow records
+func (fc *FlowCollector) convertNetFlowToRecords(packet interface{}) []*FlowRecord {
+	var records []*FlowRecord
+	
+	// Use goflow2's format package to convert to standard format
+	flowMessage := format.ConvertToProtoBuf(packet, nil)
+	if flowMessage == nil {
+		return records
+	}
+	
+	// Convert protobuf message to JSON for easier parsing
+	jsonData, err := json.Marshal(flowMessage)
+	if err != nil {
+		fc.logger.Debug("Failed to marshal flow message", "error", err)
+		return records
+	}
+	
+	var flowData map[string]interface{}
+	if err := json.Unmarshal(jsonData, &flowData); err != nil {
+		fc.logger.Debug("Failed to unmarshal flow data", "error", err)
+		return records
+	}
+	
+	// Extract flow information
+	if flows, ok := flowData["flows"].([]interface{}); ok {
+		for _, f := range flows {
+			if flow, ok := f.(map[string]interface{}); ok {
+				record := fc.extractFlowRecord(flow)
+				if record != nil {
+					records = append(records, record)
+				}
+			}
+		}
+	}
+	
+	return records
+}
 
+// Convert SFlow to flow records
+func (fc *FlowCollector) convertSFlowToRecords(packet interface{}) []*FlowRecord {
+	var records []*FlowRecord
+	
+	// Use goflow2's format package to convert to standard format
+	flowMessage := format.ConvertToProtoBuf(packet, nil)
+	if flowMessage == nil {
+		return records
+	}
+	
+	// Convert protobuf message to JSON for easier parsing
+	jsonData, err := json.Marshal(flowMessage)
+	if err != nil {
+		fc.logger.Debug("Failed to marshal flow message", "error", err)
+		return records
+	}
+	
+	var flowData map[string]interface{}
+	if err := json.Unmarshal(jsonData, &flowData); err != nil {
+		fc.logger.Debug("Failed to unmarshal flow data", "error", err)
+		return records
+	}
+	
+	// Extract flow information
+	if flows, ok := flowData["flows"].([]interface{}); ok {
+		for _, f := range flows {
+			if flow, ok := f.(map[string]interface{}); ok {
+				record := fc.extractFlowRecord(flow)
+				if record != nil {
+					records = append(records, record)
+				}
+			}
+		}
+	}
+	
+	return records
+}
+
+// Extract flow record from parsed data
+func (fc *FlowCollector) extractFlowRecord(flow map[string]interface{}) *FlowRecord {
+	record := &FlowRecord{
+		StartTime: time.Now(),
+		EndTime:   time.Now(),
+	}
+	
+	// Extract basic flow information
+	if srcAddr, ok := flow["src_addr"].(string); ok {
+		record.SrcAddr = net.ParseIP(srcAddr)
+	}
+	if dstAddr, ok := flow["dst_addr"].(string); ok {
+		record.DstAddr = net.ParseIP(dstAddr)
+	}
+	if srcPort, ok := flow["src_port"].(float64); ok {
+		record.SrcPort = uint16(srcPort)
+	}
+	if dstPort, ok := flow["dst_port"].(float64); ok {
+		record.DstPort = uint16(dstPort)
+	}
+	if proto, ok := flow["protocol"].(float64); ok {
+		record.Protocol = uint8(proto)
+	}
+	if inIf, ok := flow["in_if"].(float64); ok {
+		record.InIf = uint32(inIf)
+	}
+	if outIf, ok := flow["out_if"].(float64); ok {
+		record.OutIf = uint32(outIf)
+	}
+	if bytes, ok := flow["bytes"].(float64); ok {
+		record.Bytes = uint64(bytes)
+	}
+	if packets, ok := flow["packets"].(float64); ok {
+		record.Packets = uint64(packets)
+	}
+	
+	// Validate required fields
+	if record.SrcAddr == nil || record.DstAddr == nil {
+		return nil
+	}
+	
+	// Enrich with GeoIP and ASN data
+	fc.enrichRecord(record)
+	
+	return record
+}
+
+// Enrich record with GeoIP and ASN data
+func (fc *FlowCollector) enrichRecord(record *FlowRecord) {
+	// Check cache first
+	srcKey := record.SrcAddr.String()
+	dstKey := record.DstAddr.String()
+	
+	if entry, ok := fc.enrichmentCache.Load(srcKey); ok {
+		if e, ok := entry.(*EnrichmentEntry); ok && time.Since(e.Timestamp) < time.Hour {
+			record.SrcCountry = e.Country
+			record.SrcASN = e.ASN
+			record.SrcASNOrg = e.ASNOrg
+		}
+	} else {
+		// Enrich source IP
+		fc.enrichIP(record.SrcAddr, &record.SrcCountry, &record.SrcASN, &record.SrcASNOrg)
+		fc.enrichmentCache.Store(srcKey, &EnrichmentEntry{
+			Country:   record.SrcCountry,
+			ASN:       record.SrcASN,
+			ASNOrg:    record.SrcASNOrg,
+			Timestamp: time.Now(),
+		})
+	}
+	
+	if entry, ok := fc.enrichmentCache.Load(dstKey); ok {
+		if e, ok := entry.(*EnrichmentEntry); ok && time.Since(e.Timestamp) < time.Hour {
+			record.DstCountry = e.Country
+			record.DstASN = e.ASN
+			record.DstASNOrg = e.ASNOrg
+		}
+	} else {
+		// Enrich destination IP
+		fc.enrichIP(record.DstAddr, &record.DstCountry, &record.DstASN, &record.DstASNOrg)
+		fc.enrichmentCache.Store(dstKey, &EnrichmentEntry{
+			Country:   record.DstCountry,
+			ASN:       record.DstASN,
+			ASNOrg:    record.DstASNOrg,
+			Timestamp: time.Now(),
+		})
+	}
+}
+
+// Enrich IP with GeoIP and ASN data
+func (fc *FlowCollector) enrichIP(ip net.IP, country *string, asn *uint32, asnOrg *string) {
+	if fc.geoipDB != nil && fc.config.Enrichment.GeoIPEnabled {
+		if record, err := fc.geoipDB.Country(ip); err == nil {
+			*country = record.Country.IsoCode
+		}
+	}
+	
+	if fc.asnDB != nil && fc.config.Enrichment.ASNEnabled {
+		if record, err := fc.asnDB.ASN(ip); err == nil {
+			*asn = record.AutonomousSystemNumber
+			*asnOrg = record.AutonomousSystemOrganization
+		}
+	}
+}
+
+// Record processor
+func (fc *FlowCollector) recordProcessor() {
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case record := <-fc.recordChan:
+			fc.workerQueueLength.Set(float64(len(fc.recordChan)))
+			fc.processFlowRecord(record)
+		}
+	}
+}
+
+// Process flow record and update aggregations
+func (fc *FlowCollector) processFlowRecord(record *FlowRecord) {
+	now := time.Now()
+	
+	// Create aggregation key
+	key := fc.createAggregationKey(record)
+	
+	fc.aggMutex.Lock()
+	defer fc.aggMutex.Unlock()
+	
+	// Update aggregations for each time window
+	for _, window := range fc.config.Aggregation.TimeWindows {
+		if agg, exists := fc.aggregations[window][key]; exists {
+			agg.Flows++
+			agg.Bytes += record.Bytes
+			agg.Packets += record.Packets
+			agg.LastSeen = now
+		} else {
+			fc.aggregations[window][key] = &AggMetrics{
+				Flows:    1,
+				Bytes:    record.Bytes,
+				Packets:  record.Packets,
+				LastSeen: now,
+			}
+		}
+	}
+}
+
+// Create aggregation key based on configured dimensions
+func (fc *FlowCollector) createAggregationKey(record *FlowRecord) AggKey {
+	key := AggKey{
+		Protocol: record.Protocol,
+	}
+	
+	dimensions := fc.config.Aggregation.Dimensions
+	
+	if contains(dimensions, "src_addr") {
+		key.SrcAddr = record.SrcAddr.String()
+	}
+	if contains(dimensions, "dst_addr") {
+		key.DstAddr = record.DstAddr.String()
+	}
+	if contains(dimensions, "src_port") {
+		key.SrcPort = record.SrcPort
+	}
+	if contains(dimensions, "dst_port") {
+		key.DstPort = record.DstPort
+	}
+	if contains(dimensions, "in_if") {
+		key.InIf = record.InIf
+	}
+	if contains(dimensions, "out_if") {
+		key.OutIf = record.OutIf
+	}
+	if contains(dimensions, "src_country") {
+		key.SrcCountry = record.SrcCountry
+	}
+	if contains(dimensions, "dst_country") {
+		key.DstCountry = record.DstCountry
+	}
+	if contains(dimensions, "src_asn") {
+		key.SrcASN = record.SrcASN
+	}
+	if contains(dimensions, "dst_asn") {
+		key.DstASN = record.DstASN
+	}
+	
+	return key
+}
+
+// Aggregation cleanup worker
+func (fc *FlowCollector) aggregationCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case <-ticker.C:
+			fc.cleanupExpiredAggregations()
+		}
+	}
+}
+
+// Clean up expired aggregations
+func (fc *FlowCollector) cleanupExpiredAggregations() {
+	now := time.Now()
+	
+	fc.aggMutex.Lock()
+	defer fc.aggMutex.Unlock()
+	
+	for window, aggregations := range fc.aggregations {
+		// Parse window duration
+		windowDuration, err := parseTimeWindow(window)
+		if err != nil {
+			continue
+		}
+		
+		// Remove expired aggregations
+		for key, agg := range aggregations {
+			if now.Sub(agg.LastSeen) > windowDuration*2 {
+				delete(aggregations, key)
+			}
+		}
+	}
+}
+
+// Parse time window string to duration
+func parseTimeWindow(window string) (time.Duration, error) {
+	switch window {
+	case "1m":
+		return time.Minute, nil
+	case "5m":
+		return 5 * time.Minute, nil
+	case "15m":
+		return 15 * time.Minute, nil
+	case "1h":
+		return time.Hour, nil
+	case "1d":
+		return 24 * time.Hour, nil
+	default:
+		return time.ParseDuration(window)
+	}
+}
+
+// Metrics updater
+func (fc *FlowCollector) metricsUpdater() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-fc.ctx.Done():
+			return
+		case <-ticker.C:
+			fc.updatePrometheusMetrics()
+		}
+	}
+}
+
+// Update Prometheus metrics from aggregations
+func (fc *FlowCollector) updatePrometheusMetrics() {
+	fc.aggMutex.RLock()
+	defer fc.aggMutex.RUnlock()
+	
+	// Use the shortest time window for real-time metrics
+	window := "1m"
+	if len(fc.config.Aggregation.TimeWindows) > 0 {
+		window = fc.config.Aggregation.TimeWindows[0]
+	}
+	
+	aggregations, exists := fc.aggregations[window]
+	if !exists {
+		return
+	}
+	
+	// Calculate bandwidth and update metrics
+	windowDuration, err := parseTimeWindow(window)
+	if err != nil {
+		return
+	}
+	
+	for key, agg := range aggregations {
+		labels := fc.createPrometheusLabels(key)
+		
+		// Update counters (these are cumulative)
+		fc.flowsTotal.With(labels).Add(float64(agg.Flows))
+		fc.bytesTotal.With(labels).Add(float64(agg.Bytes))
+		fc.packetsTotal.With(labels).Add(float64(agg.Packets))
+		
+		// Calculate bandwidth in bits per second
+		bps := float64(agg.Bytes*8) / windowDuration.Seconds()
+		fc.bandwidthBps.With(labels).Set(bps)
+		
+		// Reset aggregation after updating metrics
+		agg.Flows = 0
+		agg.Bytes = 0
+		agg.Packets = 0
+	}
+}
+
+// Create Prometheus labels from aggregation key
+func (fc *FlowCollector) createPrometheusLabels(key AggKey) prometheus.Labels {
+	labels := prometheus.Labels{
+		"src_addr": key.SrcAddr,
+		"dst_addr": key.DstAddr,
+		"protocol": strconv.Itoa(int(key.Protocol)),
+	}
+	
+	enabledLabels := fc.config.Metrics.EnabledLabels
+	
+	if contains(enabledLabels, "ports") {
+		labels["src_port"] = strconv.Itoa(int(key.SrcPort))
+		labels["dst_port"] = strconv.Itoa(int(key.DstPort))
+	}
+	if contains(enabledLabels, "interfaces") {
+		labels["in_if"] = strconv.Itoa(int(key.InIf))
+		labels["out_if"] = strconv.Itoa(int(key.OutIf))
+	}
+	if contains(enabledLabels, "geo") {
+		labels["src_country"] = key.SrcCountry
+		labels["dst_country"] = key.DstCountry
+	}
+	if contains(enabledLabels, "asn") {
+		labels["src_asn"] = strconv.Itoa(int(key.SrcASN))
+		labels["dst_asn"] = strconv.Itoa(int(key.DstASN))
+	}
+	
+	// Add custom labels
+	for k, v := range fc.config.Metrics.CustomLabels {
+		labels[k] = v
+	}
+	
+	return labels
+}
+
+// Start metrics HTTP server
+func (fc *FlowCollector) startMetricsServer() {
+	mux := http.NewServeMux()
+	mux.Handle(fc.config.Server.MetricsPath, promhttp.Handler())
+	mux.HandleFunc("/health", fc.healthCheck)
+	mux.HandleFunc("/status", fc.statusHandler)
+	
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", fc.config.Server.MetricsPort),
+		Handler: mux,
+	}
+	
+	fc.logger.Info("Metrics server started", "address", server.Addr, "path", fc.config.Server.MetricsPath)
+	
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fc.logger.Error("Metrics server error", "error", err)
+	}
+}
+
+// Health check endpoint
+func (fc *FlowCollector) healthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	
+	status := map[string]interface{}{
+		"status":           "healthy",
+		"received_packets": atomic.LoadInt64(&fc.receivedCount),
+		"parsed_records":   atomic.LoadInt64(&fc.parsedCount),
+		"dropped_records":  atomic.LoadInt64(&fc.droppedCount),
+		"timestamp":        time.Now().Unix(),
+	}
+	
+	json.NewEncoder(w).Encode(status)
+}
+
+// Status endpoint
+func (fc *FlowCollector) statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	
+	fc.aggMutex.RLock()
+	aggStats := make(map[string]int)
+	for window, aggregations := range fc.aggregations {
+		aggStats[window] = len(aggregations)
+	}
+	fc.aggMutex.RUnlock()
+	
+	// Get cache size
+	cacheSize := 0
+	fc.enrichmentCache.Range(func(key, value interface{}) bool {
+		cacheSize++
+		return true
+	})
+	
+	status := map[string]interface{}{
+		"status":              "running",
+		"received_packets":    atomic.LoadInt64(&fc.receivedCount),
+		"parsed_records":      atomic.LoadInt64(&fc.parsedCount),
+		"dropped_records":     atomic.LoadInt64(&fc.droppedCount),
+		"aggregation_counts":  aggStats,
+		"enrichment_cache_size": cacheSize,
+		"queue_lengths": map[string]int{
+			"netflow": len(fc.netflowChan),
+			"sflow":   len(fc.sflowChan),
+			"ipfix":   len(fc.ipfixChan),
+			"records": len(fc.recordChan),
+		},
+		"config": fc.config,
+		"timestamp": time.Now().Unix(),
+	}
+	
+	json.NewEncoder(w).Encode(status)
+}
+
+// Stop the collector
+func (fc *FlowCollector) Stop() {
+	fc.logger.Info("Stopping flow collector")
+	fc.cancel()
+	
+	// Close databases
 	if fc.geoipDB != nil {
 		fc.geoipDB.Close()
 	}
 	if fc.asnDB != nil {
 		fc.asnDB.Close()
 	}
-
-	return nil
 }
 
+// Utility function to check if slice contains string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// Main function
 func main() {
-	configFile := "config.yaml"
+	configPath := "config.yaml"
 	if len(os.Args) > 1 {
-		configFile = os.Args[1]
+		configPath = os.Args[1]
 	}
-
-	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Config file %s not found\n", configFile)
-		os.Exit(1)
+	
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		log.Fatal("Configuration file not found", "path", configPath)
 	}
-
-	config, err := loadConfig(configFile)
+	
+	// Create collector
+	collector, err := NewFlowCollector(configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
-		os.Exit(1)
+		log.Fatal("Failed to create collector", "error", err)
 	}
-
-	collector, err := NewFlowCollector(config)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create collector: %v\n", err)
-		os.Exit(1)
-	}
-
+	defer collector.Stop()
+	
+	// Start collector
 	if err := collector.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Collector failed: %v\n", err)
-		os.Exit(1)
+		log.Fatal("Failed to start collector", "error", err)
 	}
+	
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	
+	// Wait for signal
+	sig := <-sigChan
+	collector.logger.Info("Received signal, shutting down", "signal", sig)
+	
+	// Graceful shutdown
+	collector.Stop()
+	time.Sleep(2 * time.Second)
 }
