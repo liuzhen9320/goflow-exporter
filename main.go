@@ -3,7 +3,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,12 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,6 +85,7 @@ type FlowRecord struct {
 type FlowKey struct {
 	SrcAddr     string
 	DstAddr     string
+	NextHop     string
 	SrcPort     uint16
 	DstPort     uint16
 	Protocol    uint8
@@ -122,12 +119,12 @@ const (
 
 // NetFlow v9 structures
 type NetFlowV9Header struct {
-	Version       uint16
-	Count         uint16
-	SysUptime     uint32
-	UnixSecs      uint32
-	SequenceNum   uint32
-	SourceID      uint32
+	Version     uint16
+	Count       uint16
+	SysUptime   uint32
+	UnixSecs    uint32
+	SequenceNum uint32
+	SourceID    uint32
 }
 
 type NetFlowV9FlowSet struct {
@@ -136,9 +133,9 @@ type NetFlowV9FlowSet struct {
 }
 
 type NetFlowV9Template struct {
-	TemplateID   uint16
-	FieldCount   uint16
-	Fields       []NetFlowV9Field
+	TemplateID uint16
+	FieldCount uint16
+	Fields     []NetFlowV9Field
 }
 
 type NetFlowV9Field struct {
@@ -157,13 +154,13 @@ type IPFIXHeader struct {
 
 // sFlow structures
 type SFlowHeader struct {
-	Version        uint32
-	AddressType    uint32
-	AgentAddress   [16]byte
-	SubAgentID     uint32
-	SequenceNum    uint32
-	SysUptime      uint32
-	NumSamples     uint32
+	Version      uint32
+	AddressType  uint32
+	AgentAddress [16]byte
+	SubAgentID   uint32
+	SequenceNum  uint32
+	SysUptime    uint32
+	NumSamples   uint32
 }
 
 // SFlow Sample types
@@ -174,17 +171,17 @@ const (
 )
 
 type SFlowFlowSample struct {
-	SampleType       uint32
-	SampleLength     uint32
-	SequenceNum      uint32
-	SourceIDType     uint32
-	SourceIDIndex    uint32
-	SamplingRate     uint32
-	SamplePool       uint32
-	DroppedPackets   uint32
-	InputInterface   uint32
-	OutputInterface  uint32
-	NumRecords       uint32
+	SampleType      uint32
+	SampleLength    uint32
+	SequenceNum     uint32
+	SourceIDType    uint32
+	SourceIDIndex   uint32
+	SamplingRate    uint32
+	SamplePool      uint32
+	DroppedPackets  uint32
+	InputInterface  uint32
+	OutputInterface uint32
+	NumRecords      uint32
 }
 
 // Main collector structure
@@ -197,15 +194,15 @@ type FlowCollector struct {
 	templates sync.Map
 
 	// Metrics
-	flowsTotal          *prometheus.CounterVec
-	bytesTotal          *prometheus.CounterVec
-	packetsTotal        *prometheus.CounterVec
-	bandwidthGauge      *prometheus.GaugeVec
-	receivedPackets     prometheus.Counter
-	parsedRecords       prometheus.Counter
-	droppedRecords      prometheus.Counter
-	processingDuration  prometheus.Histogram
-	workerQueueLength   prometheus.Gauge
+	flowsTotal         *prometheus.CounterVec
+	bytesTotal         *prometheus.CounterVec
+	packetsTotal       *prometheus.CounterVec
+	bandwidthGauge     *prometheus.GaugeVec
+	receivedPackets    prometheus.Counter
+	parsedRecords      prometheus.Counter
+	droppedRecords     prometheus.Counter
+	processingDuration prometheus.Histogram
+	workerQueueLength  prometheus.Gauge
 
 	// Aggregation
 	aggregatedFlows   map[string]map[FlowKey]AggregatedFlow
@@ -594,6 +591,7 @@ func (fc *FlowCollector) aggregateFlow(flow FlowRecord) {
 	key := FlowKey{
 		SrcAddr:     flow.SrcAddr.String(),
 		DstAddr:     flow.DstAddr.String(),
+		NextHop:     flow.NextHop,
 		SrcPort:     flow.SrcPort,
 		DstPort:     flow.DstPort,
 		Protocol:    flow.Protocol,
@@ -834,12 +832,12 @@ func (fc *FlowCollector) parseSFlow(data []byte, addr *net.UDPAddr) []FlowRecord
 
 				if recordType == 1 && recordLength >= 40 { // Raw packet
 					flow := FlowRecord{
-						FirstSeen:      baseTime,
-						LastSeen:       baseTime,
-						InputIface:     fs.InputInterface,
+						FirstSeen:       baseTime,
+						LastSeen:        baseTime,
+						InputIface:      fs.InputInterface,
 						OutputInterface: fs.OutputInterface,
-						Packets:        1,
-						Bytes:          1500, // estimate
+						Packets:         1,
+						Bytes:           1500, // estimate
 					}
 					flows = append(flows, flow)
 				}
