@@ -3,9 +3,9 @@ module fe
 go 1.24.5
 
 require (
-	github.com/charmbracelet/log v0.4.2
-	github.com/netsampler/goflow2 v1.3.7
-	github.com/oschwald/geoip2-golang v1.13.0
+	github.com/charmbracelet/log/v2 v2.0.0
+	github.com/netsampler/goflow2/v2 v2.2.6
+	github.com/oschwald/geoip2-golang/v2 v2.1.0
 	github.com/prometheus/client_golang v1.23.0
 	gopkg.in/yaml.v3 v3.0.1
 )
